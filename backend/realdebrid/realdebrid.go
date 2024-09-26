@@ -71,9 +71,9 @@ var (
 	}
 )
 
-//Global lists of recieved content.
-//Realdebrid content is provided in pages with 100 items per page.
-//To limit api calls all pages are stored here and are only updated on changes in the total length
+// Global lists of recieved content.
+// Realdebrid content is provided in pages with 100 items per page.
+// To limit api calls all pages are stored here and are only updated on changes in the total length
 var cached []api.Item
 var torrents []api.Item
 var broken_torrents []string
@@ -488,8 +488,8 @@ func (f *Fs) redownloadTorrent(ctx context.Context, torrent api.Item) (redownloa
 	_, _ = f.srv.CallJSON(ctx, &opts, nil, &torrent)
 	torrent.Status = "downloaded"
 	lastcheck = time.Now().Unix() - interval
-	for i, TorrentID := range broken_torrents {
-		if dead_torrent_id == TorrentID {
+	for i := len(broken_torrents) - 1; i >= 0; i-- {
+		if dead_torrent_id == broken_torrents[i] {
 			broken_torrents[i] = broken_torrents[len(broken_torrents)-1]
 			broken_torrents = broken_torrents[:len(broken_torrents)-1]
 		}
@@ -890,7 +890,7 @@ func (f *Fs) List(ctx context.Context, dir string) (entries fs.DirEntries, err e
 // Creates from the parameters passed in a half finished Object which
 // must have setMetaData called on it
 //
-// Returns the object, leaf, directoryID and error
+// # Returns the object, leaf, directoryID and error
 //
 // Used to create new objects
 func (f *Fs) createObject(ctx context.Context, remote string, modTime time.Time, size int64) (o *Object, leaf string, directoryID string, err error) {
@@ -909,7 +909,7 @@ func (f *Fs) createObject(ctx context.Context, remote string, modTime time.Time,
 
 // Put the object
 //
-// Copy the reader in to the new object which is returned
+// # Copy the reader in to the new object which is returned
 //
 // The new object may have been created if an error is returned
 func (f *Fs) Put(ctx context.Context, in io.Reader, src fs.ObjectInfo, options ...fs.OpenOption) (fs.Object, error) {
@@ -927,9 +927,9 @@ func (f *Fs) Put(ctx context.Context, in io.Reader, src fs.ObjectInfo, options .
 
 // PutUnchecked the object into the container
 //
-// This will produce an error if the object already exists
+// # This will produce an error if the object already exists
 //
-// Copy the reader in to the new object which is returned
+// # Copy the reader in to the new object which is returned
 //
 // The new object may have been created if an error is returned
 func (f *Fs) PutUnchecked(ctx context.Context, in io.Reader, src fs.ObjectInfo, options ...fs.OpenOption) (fs.Object, error) {
@@ -1013,9 +1013,9 @@ func (f *Fs) move(ctx context.Context, isFile bool, id, oldLeaf, newLeaf, oldDir
 
 // Move src to this remote using server-side move operations.
 //
-// This is stored with the remote path given
+// # This is stored with the remote path given
 //
-// It returns the destination Object and a possible error
+// # It returns the destination Object and a possible error
 //
 // Will only be called if src.Fs().Name() == f.Name()
 //
@@ -1171,7 +1171,6 @@ func (o *Object) readMetaData(ctx context.Context) (err error) {
 
 // ModTime returns the modification time of the object
 //
-//
 // It attempts to read the objects mtime and if that isn't present the
 // LastModified returned in the http headers
 func (o *Object) ModTime(ctx context.Context) time.Time {
@@ -1232,7 +1231,7 @@ func (o *Object) Open(ctx context.Context, options ...fs.OpenOption) (in io.Read
 
 // Update the object with the contents of the io.Reader, modTime and size
 //
-// If existing is set then it updates the object rather than creating a new one
+// # If existing is set then it updates the object rather than creating a new one
 //
 // The new object may have been created if an error is returned
 func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, options ...fs.OpenOption) (err error) {
