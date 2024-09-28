@@ -29,6 +29,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/PuerkitoBio/goquery"
 	"github.com/rclone/rclone/backend/realdebrid/api"
 	"github.com/rclone/rclone/fs"
 	"github.com/rclone/rclone/fs/config"
@@ -236,17 +237,32 @@ func (f *Fs) readMetaDataForPath(ctx context.Context, path string, directoriesOn
 // errorHandler parses a non 2xx error response into an error
 func errorHandler(resp *http.Response) error {
 	body, err := rest.ReadBody(resp)
-	if err != nil {
-		body = nil
+	if err != nil || body == nil {
+		return &api.Response{
+			Message: "Failed to read response body",
+			Status:  fmt.Sprintf("%s (%d)", resp.Status, resp.StatusCode),
+		}
 	}
-	var e = api.Response{
+
+	if strings.ToLower(resp.Header.Get("Content-Type")) == "text/html" {
+		doc, parseErr := goquery.NewDocumentFromReader(strings.NewReader(string(body)))
+		if parseErr == nil {
+			return &api.Response{
+				Message: doc.Text(),
+				Status:  fmt.Sprintf("%s (%d)", resp.Status, resp.StatusCode),
+			}
+		}
+		fs.Debugf(resp, "error parsing HTML response: %v", parseErr)
+	}
+
+	e := &api.Response{
 		Message: string(body),
 		Status:  fmt.Sprintf("%s (%d)", resp.Status, resp.StatusCode),
 	}
-	if body != nil {
-		_ = json.Unmarshal(body, &e)
-	}
-	return &e
+
+	_ = json.Unmarshal(body, e)
+
+	return e
 }
 
 // Return a url.Values with the api key in
@@ -391,7 +407,7 @@ func (f *Fs) CreateDir(ctx context.Context, pathID, leaf string) (newID string, 
 
 // Redownload a dead torrent
 func (f *Fs) redownloadTorrent(ctx context.Context, torrent api.Item) (redownloaded_torrent api.Item) {
-	fmt.Println("Redownloading dead torrent: " + torrent.Name)
+	fs.Debugf(f, "Redownloading dead torrent: %s", torrent.Name)
 	//Get dead torrent file and hash info
 	var method = "GET"
 	var path = "/torrents/info/" + torrent.ID
@@ -552,7 +568,7 @@ func (f *Fs) listAll(ctx context.Context, dirID string, directoriesOnly bool, fi
 					if err == nil {
 						if totalcount != len(cached) || time.Now().Unix()-lastcheck > interval {
 							if time.Now().Unix()-lastcheck > interval && !printed {
-								fmt.Println("Last update more than 15min ago. Updating links and torrents.")
+								fs.Infoc(f, "Last update more than 15min ago. Updating links and torrents.")
 								printed = true
 							}
 							newcached = append(newcached, partialresult...)
@@ -1192,6 +1208,18 @@ func (o *Object) Storable() bool {
 	return true
 }
 
+// addBrokenTorrent adds a torrent to the list of broken torrents
+func (o *Object) addBrokenTorrent() {
+	for _, TorrentID := range broken_torrents {
+		if o.ParentID == TorrentID {
+			return
+		}
+	}
+
+	fs.Debug(o, "this link seems to be broken. torrent will be re-downloaded on next refresh")
+	broken_torrents = append(broken_torrents, o.ParentID)
+}
+
 // Open an object for read
 func (o *Object) Open(ctx context.Context, options ...fs.OpenOption) (in io.ReadCloser, err error) {
 	if o.url == "" {
@@ -1199,7 +1227,7 @@ func (o *Object) Open(ctx context.Context, options ...fs.OpenOption) (in io.Read
 	}
 	fs.FixRangeOption(options, o.size)
 	var resp *http.Response
-	var err_code = 0
+	var errCode = 0
 	opts := rest.Opts{
 		Path:    "",
 		RootURL: o.url,
@@ -1209,21 +1237,18 @@ func (o *Object) Open(ctx context.Context, options ...fs.OpenOption) (in io.Read
 	err = o.fs.pacer.Call(func() (bool, error) {
 		resp, err = o.fs.srv.Call(ctx, &opts)
 		if resp != nil {
-			err_code = resp.StatusCode
+			errCode = resp.StatusCode
 		}
 		return shouldRetry(ctx, resp, err)
 	})
+
 	if err != nil {
-		if err_code == 503 {
-			for _, TorrentID := range broken_torrents {
-				if o.ParentID == TorrentID {
-					return nil, err
-				}
-			}
-			fmt.Println("Error opening file: '" + o.url + "'.")
-			fmt.Println("This link seems to be broken. Torrent will be re-downloaded on next refresh.")
-			broken_torrents = append(broken_torrents, o.ParentID)
+		fs.Errorf(o, "error opening file: %q: %s", o.url, err)
+
+		if errCode == 503 {
+			o.addBrokenTorrent()
 		}
+
 		return nil, err
 	}
 	return resp.Body, err
