@@ -20,11 +20,15 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net/http"
+	"net/url"
 	"path"
 	"strings"
 	"sync"
 	"time"
 
+	realdebrid "github.com/rclone/rclone/backend/realdebrid"
+	realdebridapi "github.com/rclone/rclone/backend/realdebrid/api"
 	"github.com/rclone/rclone/fs"
 	"github.com/rclone/rclone/fs/config"
 	"github.com/rclone/rclone/fs/config/configmap"
@@ -36,6 +40,7 @@ import (
 	"github.com/rclone/rclone/lib/encoder"
 	"github.com/rclone/rclone/lib/pacer"
 	"github.com/rclone/rclone/lib/readers"
+	"github.com/rclone/rclone/lib/rest"
 	mega "github.com/t3rm1n4l/go-mega"
 )
 
@@ -44,11 +49,15 @@ const (
 	maxSleep      = 2 * time.Second
 	eventWaitTime = 500 * time.Millisecond
 	decayConstant = 2 // bigger for slower decay, exponential
+	rdURL         = "https://api.real-debrid.com/rest/1.0"
 )
 
 var (
 	megaCacheMu sync.Mutex                // mutex for the below
 	megaCache   = map[string]*mega.Mega{} // cache logged in Mega's by user
+
+	megaLinksMu sync.Mutex                                             // mutex for the below
+	megaLinks   = map[string]*realdebridapi.UnrestrictedLinkResponse{} // cache of realdebrid unrestricted links by mega id
 )
 
 // Register with Fs
@@ -67,6 +76,12 @@ func init() {
 			Help:       "Password.",
 			Required:   true,
 			IsPassword: true,
+		}, {
+			Name:     "realdebrid_token",
+			Help:     "RealDebrid API Token, for faster downloads.",
+			Required: false,
+			Advanced: true,
+			Default:  "",
 		}, {
 			Name: "debug",
 			Help: `Output more debug from Mega.
@@ -108,12 +123,13 @@ Enabling it will increase CPU usage and add network overhead.`,
 
 // Options defines the configuration for this backend
 type Options struct {
-	User       string               `config:"user"`
-	Pass       string               `config:"pass"`
-	Debug      bool                 `config:"debug"`
-	HardDelete bool                 `config:"hard_delete"`
-	UseHTTPS   bool                 `config:"use_https"`
-	Enc        encoder.MultiEncoder `config:"encoding"`
+	User            string               `config:"user"`
+	Pass            string               `config:"pass"`
+	RealDebridToken string               `config:"realdebrid_token"`
+	Debug           bool                 `config:"debug"`
+	HardDelete      bool                 `config:"hard_delete"`
+	UseHTTPS        bool                 `config:"use_https"`
+	Enc             encoder.MultiEncoder `config:"encoding"`
 }
 
 // Fs represents a remote mega
@@ -123,6 +139,7 @@ type Fs struct {
 	opt        Options      // parsed config options
 	features   *fs.Features // optional features
 	srv        *mega.Mega   // the connection to the server
+	rdClient   *rest.Client // the client for realdebrid if configured
 	pacer      *fs.Pacer    // pacer for API calls
 	rootNodeMu sync.Mutex   // mutex for _rootNode
 	_rootNode  *mega.Node   // root node - call findRoot to use this
@@ -236,11 +253,12 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 
 	root = parsePath(root)
 	f := &Fs{
-		name:  name,
-		root:  root,
-		opt:   *opt,
-		srv:   srv,
-		pacer: fs.NewPacer(ctx, pacer.NewDefault(pacer.MinSleep(minSleep), pacer.MaxSleep(maxSleep), pacer.DecayConstant(decayConstant))),
+		name:     name,
+		root:     root,
+		opt:      *opt,
+		srv:      srv,
+		rdClient: rest.NewClient(fshttp.NewClient(ctx)).SetRoot(rdURL),
+		pacer:    fs.NewPacer(ctx, pacer.NewDefault(pacer.MinSleep(minSleep), pacer.MaxSleep(maxSleep), pacer.DecayConstant(decayConstant))),
 	}
 	f.features = (&fs.Features{
 		DuplicateFiles:          true,
@@ -1093,6 +1111,65 @@ func (oo *openObject) Close() (err error) {
 
 // Open an object for read
 func (o *Object) Open(ctx context.Context, options ...fs.OpenOption) (in io.ReadCloser, err error) {
+	realDebridToken := o.fs.opt.RealDebridToken
+	if realDebridToken != "" {
+		fs.Infoc(o, "Using realdebrid for faster downloads")
+		fs.Infoc(o, "Note that you should use a low number of threaded streams for this to work properly")
+
+		megaLinksMu.Lock()
+		defer megaLinksMu.Unlock()
+		unrestrictedLink := megaLinks[o.ID()]
+
+		if unrestrictedLink == nil {
+			fs.Debugf(o, "No unrestricted link found, creating one")
+			link, err := o.fs.srv.Link(o.info, true)
+			if err != nil {
+				return nil, fmt.Errorf("Failed to create public link: %w", err)
+			}
+			fs.Debugf(o, "Download link: %q", link)
+
+			var unrestrictedLinkResponse realdebridapi.UnrestrictedLinkResponse
+			path := "/unrestrict/link"
+			opts := rest.Opts{
+				Method: "POST",
+				Path:   path,
+				ExtraHeaders: map[string]string{
+					"Authorization": fmt.Sprintf("Bearer %s", realDebridToken),
+				},
+				MultipartParams: url.Values{
+					"link": {link},
+				},
+			}
+			_, err = o.fs.rdClient.CallJSON(ctx, &opts, nil, &unrestrictedLinkResponse)
+			if err != nil {
+				return nil, fmt.Errorf("Failed to unrestrict link: %w", err)
+			}
+			unrestrictedLink = &unrestrictedLinkResponse
+			megaLinks[o.ID()] = unrestrictedLink
+		}
+
+		fs.Debugf(o, "Unrestricted link: %q", unrestrictedLink.Download)
+
+		fs.FixRangeOption(options, unrestrictedLink.Filesize)
+		var resp *http.Response
+		opts := rest.Opts{
+			Path:    "",
+			RootURL: unrestrictedLink.Download,
+			Method:  "GET",
+			Options: options,
+		}
+		err = o.fs.pacer.Call(func() (bool, error) {
+			resp, err = o.fs.rdClient.Call(ctx, &opts)
+			return realdebrid.ShouldRetry(ctx, resp, err)
+		})
+
+		if err != nil {
+			return nil, err
+		}
+
+		return resp.Body, err
+	}
+
 	var offset, limit int64 = 0, -1
 	for _, option := range options {
 		switch x := option.(type) {

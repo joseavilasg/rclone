@@ -95,3 +95,18 @@ type AccountInfoResponse struct {
 	PremiumUntil int64   `json:"premium_until,omitempty"`
 	SpaceUsed    float64 `json:"space_used,omitempty"`
 }
+
+// Return value for a unique generated link
+type UnrestrictedLinkResponse struct {
+	ID         string `json:"id"`
+	Filename   string `json:"filename"`
+	MimeType   string `json:"mimeType"`
+	Filesize   int64  `json:"filesize"`
+	Link       string `json:"link"`
+	Host       string `json:"host"`
+	HostIcon   string `json:"host_icon"`
+	Chunks     int    `json:"chunks"`
+	Crc        int    `json:"crc"`
+	Download   string `json:"download"`
+	Streamable int    `json:"streamable"`
+}
