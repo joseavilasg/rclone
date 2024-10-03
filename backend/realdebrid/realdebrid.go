@@ -197,9 +197,9 @@ var retryErrorCodes = []int{
 	509, // Bandwidth Limit Exceeded
 }
 
-// shouldRetry returns a boolean as to whether this resp and err
+// ShouldRetry returns a boolean as to whether this resp and err
 // deserve to be retried.  It returns the err as a convenience
-func shouldRetry(ctx context.Context, resp *http.Response, err error) (bool, error) {
+func ShouldRetry(ctx context.Context, resp *http.Response, err error) (bool, error) {
 	if fserrors.ContextError(ctx, &err) {
 		return false, err
 	}
@@ -818,7 +818,7 @@ func (f *Fs) listAll(ctx context.Context, dirID string, directoriesOnly bool, fi
 					break
 				}
 			}
-			return shouldRetry(ctx, resp, err)
+			return ShouldRetry(ctx, resp, err)
 		})
 	}
 	if err != nil {
@@ -989,7 +989,7 @@ func (f *Fs) purgeCheck(ctx context.Context, dir string, check bool) error {
 	var result api.Response
 	err = f.pacer.Call(func() (bool, error) {
 		resp, err = f.srv.CallJSON(ctx, &opts, nil, &result)
-		return shouldRetry(ctx, resp, err)
+		return ShouldRetry(ctx, resp, err)
 	})
 	f.dirCache.FlushDir(dir)
 	return nil
@@ -1239,7 +1239,7 @@ func (o *Object) Open(ctx context.Context, options ...fs.OpenOption) (in io.Read
 		if resp != nil {
 			errCode = resp.StatusCode
 		}
-		return shouldRetry(ctx, resp, err)
+		return ShouldRetry(ctx, resp, err)
 	})
 
 	if err != nil {
