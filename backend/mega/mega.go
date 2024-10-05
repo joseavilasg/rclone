@@ -83,6 +83,12 @@ func init() {
 			Advanced: true,
 			Default:  "",
 		}, {
+			Name:     "realdebrid_remote",
+			Help:     "Whether to use RealDebrid remote traffic or not.",
+			Required: false,
+			Advanced: true,
+			Default:  false,
+		}, {
 			Name: "debug",
 			Help: `Output more debug from Mega.
 
@@ -123,13 +129,14 @@ Enabling it will increase CPU usage and add network overhead.`,
 
 // Options defines the configuration for this backend
 type Options struct {
-	User            string               `config:"user"`
-	Pass            string               `config:"pass"`
-	RealDebridToken string               `config:"realdebrid_token"`
-	Debug           bool                 `config:"debug"`
-	HardDelete      bool                 `config:"hard_delete"`
-	UseHTTPS        bool                 `config:"use_https"`
-	Enc             encoder.MultiEncoder `config:"encoding"`
+	User             string               `config:"user"`
+	Pass             string               `config:"pass"`
+	RealDebridToken  string               `config:"realdebrid_token"`
+	RealdebridRemote bool                 `config:"realdebrid_remote"`
+	Debug            bool                 `config:"debug"`
+	HardDelete       bool                 `config:"hard_delete"`
+	UseHTTPS         bool                 `config:"use_https"`
+	Enc              encoder.MultiEncoder `config:"encoding"`
 }
 
 // Fs represents a remote mega
@@ -1128,6 +1135,12 @@ func (o *Object) Open(ctx context.Context, options ...fs.OpenOption) (in io.Read
 			}
 			fs.Debugf(o, "Download link: %q", link)
 
+			remote := "0"
+
+			if o.fs.opt.RealdebridRemote {
+				remote = "1"
+			}
+
 			var unrestrictedLinkResponse realdebridapi.UnrestrictedLinkResponse
 			path := "/unrestrict/link"
 			opts := rest.Opts{
@@ -1137,7 +1150,8 @@ func (o *Object) Open(ctx context.Context, options ...fs.OpenOption) (in io.Read
 					"Authorization": fmt.Sprintf("Bearer %s", realDebridToken),
 				},
 				MultipartParams: url.Values{
-					"link": {link},
+					"link":   {link},
+					"remote": {remote},
 				},
 			}
 			_, err = o.fs.rdClient.CallJSON(ctx, &opts, nil, &unrestrictedLinkResponse)
