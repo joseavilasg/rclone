@@ -92,6 +92,12 @@ func init() {
 			Advanced: true,
 			Default:  false,
 		}, {
+			Name:     "only_unrestrict_links",
+			Help:     "This will only unrestrict links and not download them.",
+			Required: false,
+			Advanced: true,
+			Default:  false,
+		}, {
 			Name: "debug",
 			Help: `Output more debug from Mega.
 
@@ -132,14 +138,15 @@ Enabling it will increase CPU usage and add network overhead.`,
 
 // Options defines the configuration for this backend
 type Options struct {
-	User             string               `config:"user"`
-	Pass             string               `config:"pass"`
-	RealDebridToken  string               `config:"realdebrid_token"`
-	RealdebridRemote bool                 `config:"realdebrid_remote"`
-	Debug            bool                 `config:"debug"`
-	HardDelete       bool                 `config:"hard_delete"`
-	UseHTTPS         bool                 `config:"use_https"`
-	Enc              encoder.MultiEncoder `config:"encoding"`
+	User                string               `config:"user"`
+	Pass                string               `config:"pass"`
+	RealDebridToken     string               `config:"realdebrid_token"`
+	RealdebridRemote    bool                 `config:"realdebrid_remote"`
+	OnlyUnrestrictLinks bool                 `config:"only_unrestrict_links"`
+	Debug               bool                 `config:"debug"`
+	HardDelete          bool                 `config:"hard_delete"`
+	UseHTTPS            bool                 `config:"use_https"`
+	Enc                 encoder.MultiEncoder `config:"encoding"`
 }
 
 // Fs represents a remote mega
@@ -1304,6 +1311,11 @@ func (o *Object) Open(ctx context.Context, options ...fs.OpenOption) (in io.Read
 		}
 
 		fs.Debugf(o, "Unrestricted link: %q", unrestrictedLink.Download)
+
+		if o.fs.opt.OnlyUnrestrictLinks {
+			fs.Infoc(o, "Only unrestricting links, not downloading")
+			return io.NopCloser(io.LimitReader(strings.NewReader(""), unrestrictedLink.Filesize)), nil
+		}
 
 		fs.FixRangeOption(options, unrestrictedLink.Filesize)
 		var resp *http.Response
