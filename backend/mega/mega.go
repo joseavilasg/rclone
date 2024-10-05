@@ -23,12 +23,13 @@ import (
 	"net/http"
 	"net/url"
 	"path"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
 
+	api "github.com/rclone/rclone/backend/mega/api"
 	realdebrid "github.com/rclone/rclone/backend/realdebrid"
-	realdebridapi "github.com/rclone/rclone/backend/realdebrid/api"
 	"github.com/rclone/rclone/fs"
 	"github.com/rclone/rclone/fs/config"
 	"github.com/rclone/rclone/fs/config/configmap"
@@ -50,14 +51,16 @@ const (
 	eventWaitTime = 500 * time.Millisecond
 	decayConstant = 2 // bigger for slower decay, exponential
 	rdURL         = "https://api.real-debrid.com/rest/1.0"
+	rdHostName    = "mega.co.nz"
 )
 
 var (
 	megaCacheMu sync.Mutex                // mutex for the below
 	megaCache   = map[string]*mega.Mega{} // cache logged in Mega's by user
 
-	megaLinksMu sync.Mutex                                             // mutex for the below
-	megaLinks   = map[string]*realdebridapi.UnrestrictedLinkResponse{} // cache of realdebrid unrestricted links by mega id
+	megaLinksMu        sync.Mutex                         // mutex for the below
+	megaLinks          = map[string]*api.RealDebridLink{} // cache of realdebrid unrestricted links by mega id
+	rdDownloadsFetched = false
 )
 
 // Register with Fs
@@ -161,9 +164,10 @@ type Fs struct {
 // expect you to build an entire tree of all the objects in memory.
 // In this case we just store a pointer to the object.
 type Object struct {
-	fs     *Fs        // what this object is part of
-	remote string     // The remote path
-	info   *mega.Node // pointer to the mega node
+	fs         *Fs        // what this object is part of
+	remote     string     // The remote path
+	info       *mega.Node // pointer to the mega node
+	publicLink string     // public link if available
 }
 
 // ------------------------------------------------------------
@@ -1116,6 +1120,154 @@ func (oo *openObject) Close() (err error) {
 	return nil
 }
 
+// fetchMegaRDDownloads fetches all mega downloads from realdebrid
+// and stores them in memory cache
+func (o *Object) fetchMegaRDDownloads(ctx context.Context) error {
+	fs.Debug(o, "Fetching realdebrid downloads")
+	path := "/downloads"
+	method := "GET"
+
+	var partialResult []api.RealDebridLink
+	var result []api.RealDebridLink
+	var resp *http.Response
+	var err error
+
+	opts := rest.Opts{
+		Method: method,
+		Path:   path,
+		ExtraHeaders: map[string]string{
+			"Authorization": fmt.Sprintf("Bearer %s", o.fs.opt.RealDebridToken),
+		},
+	}
+
+	err = o.fs.pacer.Call(func() (bool, error) {
+		for {
+			resp, err = o.fs.rdClient.CallJSON(ctx, &opts, nil, &partialResult)
+			if err != nil {
+				return realdebrid.ShouldRetry(ctx, resp, err)
+			}
+
+			totalCountStr := resp.Header.Get("X-Total-Count")
+			if totalCountStr == "" {
+				return false, fmt.Errorf("missing X-Total-Count header")
+			}
+
+			totalCount, err := strconv.Atoi(totalCountStr)
+			if err != nil {
+				return false, fmt.Errorf("invalid X-Total-Count header: %w", err)
+			}
+
+			result = append(result, partialResult...)
+			if len(result) >= totalCount {
+				break
+			}
+
+			opts.Parameters.Set("offset", strconv.Itoa(len(result)))
+		}
+		return false, nil
+	})
+
+	if err != nil {
+		return fmt.Errorf("failed to fetch realdebrid downloads: %w", err)
+	}
+
+	megaLinksMu.Lock()
+	defer megaLinksMu.Unlock()
+
+	for _, download := range result {
+		if download.Host == rdHostName {
+			hash, err := o.getLinkHash(download.Link)
+			if err != nil {
+				return err
+			}
+			megaLinks[hash] = &download
+		}
+	}
+
+	fs.Debugf(o, "Fetched %d realdebrid mega downloads", len(megaLinks))
+
+	rdDownloadsFetched = true
+
+	return nil
+}
+
+// getLinkHash returns the hash of the link
+func (o *Object) getLinkHash(link string) (string, error) {
+	parsedURL, err := url.Parse(link)
+	if err != nil {
+		return "", fmt.Errorf("failed to parse link: %w", err)
+	}
+
+	if parsedURL.Fragment != "" {
+		return "#" + parsedURL.Fragment, nil
+	}
+
+	// Old format link (https://mega.nz/#!hash!password)
+	if strings.Contains(link, "#!") {
+		return link[strings.Index(link, "#"):], nil
+	}
+
+	return "", fmt.Errorf("failed to get lnk hash")
+}
+
+// getPublicLink returns the public link of the object
+func (o *Object) getPublicLink() (string, error) {
+	link, err := o.fs.srv.Link(o.info, true)
+	if err != nil {
+		return "", fmt.Errorf("Failed to create public link: %w", err)
+	}
+
+	return link, nil
+}
+
+// unrestrictLink unrestricts the link and stores the unrestricted link
+// This is not thread safe and should be called with the lock held
+func (o *Object) unrestrictLink(ctx context.Context) (err error) {
+	fs.Debugf(o, "No unrestricted link found, creating one")
+	link := o.publicLink
+
+	if link == "" {
+		link, err = o.getPublicLink()
+		if err != nil {
+			return err
+		}
+	}
+	fs.Debugf(o, "Download link: %q", link)
+
+	hash, err := o.getLinkHash(link)
+	if err != nil {
+		return err
+	}
+
+	remote := "0"
+
+	if o.fs.opt.RealdebridRemote {
+		remote = "1"
+	}
+
+	var unrestrictedLinkResponse api.RealDebridLink
+	path := "/unrestrict/link"
+	opts := rest.Opts{
+		Method: "POST",
+		Path:   path,
+		ExtraHeaders: map[string]string{
+			"Authorization": fmt.Sprintf("Bearer %s", o.fs.opt.RealDebridToken),
+		},
+		MultipartParams: url.Values{
+			"link":   {link},
+			"remote": {remote},
+		},
+	}
+
+	_, err = o.fs.rdClient.CallJSON(ctx, &opts, nil, &unrestrictedLinkResponse)
+	if err != nil {
+		return fmt.Errorf("Failed to unrestrict link: %w", err)
+	}
+	megaLinks[hash] = &unrestrictedLinkResponse
+
+	return nil
+}
+
 // Open an object for read
 func (o *Object) Open(ctx context.Context, options ...fs.OpenOption) (in io.ReadCloser, err error) {
 	realDebridToken := o.fs.opt.RealDebridToken
@@ -1123,43 +1275,32 @@ func (o *Object) Open(ctx context.Context, options ...fs.OpenOption) (in io.Read
 		fs.Infoc(o, "Using realdebrid for faster downloads")
 		fs.Infoc(o, "Note that you should use a low number of threaded streams for this to work properly")
 
+		if !rdDownloadsFetched {
+			if err := o.fetchMegaRDDownloads(ctx); err != nil {
+				fs.Error(o, err.Error())
+				return nil, err
+			}
+		}
+
+		link, err := o.getPublicLink()
+		if err != nil {
+			return nil, err
+		}
+
+		hash, err := o.getLinkHash(link)
+		if err != nil {
+			return nil, err
+		}
+
 		megaLinksMu.Lock()
 		defer megaLinksMu.Unlock()
-		unrestrictedLink := megaLinks[o.ID()]
-
+		unrestrictedLink := megaLinks[hash]
 		if unrestrictedLink == nil {
-			fs.Debugf(o, "No unrestricted link found, creating one")
-			link, err := o.fs.srv.Link(o.info, true)
-			if err != nil {
-				return nil, fmt.Errorf("Failed to create public link: %w", err)
+			if err := o.unrestrictLink(ctx); err != nil {
+				fs.Error(o, err.Error())
+				return nil, err
 			}
-			fs.Debugf(o, "Download link: %q", link)
-
-			remote := "0"
-
-			if o.fs.opt.RealdebridRemote {
-				remote = "1"
-			}
-
-			var unrestrictedLinkResponse realdebridapi.UnrestrictedLinkResponse
-			path := "/unrestrict/link"
-			opts := rest.Opts{
-				Method: "POST",
-				Path:   path,
-				ExtraHeaders: map[string]string{
-					"Authorization": fmt.Sprintf("Bearer %s", realDebridToken),
-				},
-				MultipartParams: url.Values{
-					"link":   {link},
-					"remote": {remote},
-				},
-			}
-			_, err = o.fs.rdClient.CallJSON(ctx, &opts, nil, &unrestrictedLinkResponse)
-			if err != nil {
-				return nil, fmt.Errorf("Failed to unrestrict link: %w", err)
-			}
-			unrestrictedLink = &unrestrictedLinkResponse
-			megaLinks[o.ID()] = unrestrictedLink
+			unrestrictedLink = megaLinks[hash]
 		}
 
 		fs.Debugf(o, "Unrestricted link: %q", unrestrictedLink.Download)
