@@ -1129,6 +1129,7 @@ func (oo *openObject) Close() (err error) {
 
 // fetchMegaRDDownloads fetches all mega downloads from realdebrid
 // and stores them in memory cache
+// This is not thread safe and should be called with the lock held
 func (o *Object) fetchMegaRDDownloads(ctx context.Context) error {
 	fs.Debug(o, "Fetching realdebrid downloads")
 	path := "/downloads"
@@ -1177,9 +1178,6 @@ func (o *Object) fetchMegaRDDownloads(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("failed to fetch realdebrid downloads: %w", err)
 	}
-
-	megaLinksMu.Lock()
-	defer megaLinksMu.Unlock()
 
 	for _, download := range result {
 		if download.Host == rdHostName {
@@ -1282,12 +1280,14 @@ func (o *Object) Open(ctx context.Context, options ...fs.OpenOption) (in io.Read
 		fs.Infoc(o, "Using realdebrid for faster downloads")
 		fs.Infoc(o, "Note that you should use a low number of threaded streams for this to work properly")
 
+		megaLinksMu.Lock()
 		if !rdDownloadsFetched {
 			if err := o.fetchMegaRDDownloads(ctx); err != nil {
 				fs.Error(o, err.Error())
 				return nil, err
 			}
 		}
+		megaLinksMu.Unlock()
 
 		link, err := o.getPublicLink()
 		if err != nil {
@@ -1300,7 +1300,6 @@ func (o *Object) Open(ctx context.Context, options ...fs.OpenOption) (in io.Read
 		}
 
 		megaLinksMu.Lock()
-		defer megaLinksMu.Unlock()
 		unrestrictedLink := megaLinks[hash]
 		if unrestrictedLink == nil {
 			if err := o.unrestrictLink(ctx); err != nil {
@@ -1309,6 +1308,7 @@ func (o *Object) Open(ctx context.Context, options ...fs.OpenOption) (in io.Read
 			}
 			unrestrictedLink = megaLinks[hash]
 		}
+		megaLinksMu.Unlock()
 
 		fs.Debugf(o, "Unrestricted link: %q", unrestrictedLink.Download)
 
