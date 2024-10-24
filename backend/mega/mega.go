@@ -92,6 +92,12 @@ func init() {
 			Advanced: true,
 			Default:  false,
 		}, {
+			Name:     "realdebrid_ip",
+			Help:     "Allowed IP",
+			Required: false,
+			Advanced: true,
+			Default:  "",
+		}, {
 			Name:     "only_unrestrict_links",
 			Help:     "This will only unrestrict links and not download them.",
 			Required: false,
@@ -142,6 +148,7 @@ type Options struct {
 	Pass                string               `config:"pass"`
 	RealDebridToken     string               `config:"realdebrid_token"`
 	RealdebridRemote    bool                 `config:"realdebrid_remote"`
+	RealdebridIP        string               `config:"realdebrid_ip"`
 	OnlyUnrestrictLinks bool                 `config:"only_unrestrict_links"`
 	Debug               bool                 `config:"debug"`
 	HardDelete          bool                 `config:"hard_delete"`
@@ -1252,16 +1259,20 @@ func (o *Object) unrestrictLink(ctx context.Context) (err error) {
 
 	var unrestrictedLinkResponse api.RealDebridLink
 	path := "/unrestrict/link"
+	params := url.Values{
+		"link":   {link},
+		"remote": {remote},
+	}
+	if o.fs.opt.RealdebridIP != "" {
+		params.Set("ip", o.fs.opt.RealdebridIP)
+	}
 	opts := rest.Opts{
 		Method: "POST",
 		Path:   path,
 		ExtraHeaders: map[string]string{
 			"Authorization": fmt.Sprintf("Bearer %s", o.fs.opt.RealDebridToken),
 		},
-		MultipartParams: url.Values{
-			"link":   {link},
-			"remote": {remote},
-		},
+		MultipartParams: params,
 	}
 
 	_, err = o.fs.rdClient.CallJSON(ctx, &opts, nil, &unrestrictedLinkResponse)
