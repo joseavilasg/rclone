@@ -102,6 +102,11 @@ func init() {
 			Advanced: true,
 			Default:  "folders",
 		}, {
+			Name:     "redownload_broken_torrents",
+			Help:     `whether to redownload torrents that are marked as dead. Default: false`,
+			Advanced: true,
+			Default:  false,
+		}, {
 			Name:     "regex_shows",
 			Help:     `please define the regex definition that will determine if a torrent should be classified as a show. Default: "(?i)(S[0-9]{2}|SEASON|COMPLETE|[^457a-z\W\s]-[0-9]+)"`,
 			Advanced: true,
@@ -126,12 +131,13 @@ func init() {
 
 // Options defines the configuration for this backend
 type Options struct {
-	RegexShows   string               `config:"regex_shows"`
-	RegexMovies  string               `config:"regex_movies"`
-	SharedFolder string               `config:"folder_mode"`
-	RootFolderID string               `config:"download_mode"`
-	APIKey       string               `config:"api_key"`
-	Enc          encoder.MultiEncoder `config:"encoding"`
+	RegexShows               string               `config:"regex_shows"`
+	RegexMovies              string               `config:"regex_movies"`
+	SharedFolder             string               `config:"folder_mode"`
+	RootFolderID             string               `config:"download_mode"`
+	RedownloadBrokenTorrents bool                 `config:"redownload_broken_torrents"`
+	APIKey                   string               `config:"api_key"`
+	Enc                      encoder.MultiEncoder `config:"encoding"`
 }
 
 // Fs represents a remote cloud storage system
@@ -234,9 +240,38 @@ func (f *Fs) readMetaDataForPath(ctx context.Context, path string, directoriesOn
 	return info, nil
 }
 
+const (
+	ErrorBytesLimitReached = "bytes_limit_reached"
+)
+
+var RealDebridErrorMap = map[string]string{
+	ErrorBytesLimitReached: "You have exceeded your traffic limit on this hoster",
+}
+
 // errorHandler parses a non 2xx error response into an error
 func errorHandler(resp *http.Response) error {
 	body, err := rest.ReadBody(resp)
+
+	xErrorHeader := resp.Header.Get("X-Error")
+	if xErrorHeader != "" {
+		var err error
+		if xErrorMessage, ok := RealDebridErrorMap[xErrorHeader]; ok {
+			err = &api.Response{
+				Message: xErrorMessage,
+				Status:  fmt.Sprintf("%s (%d)", resp.Status, resp.StatusCode),
+			}
+		} else {
+			err = &api.Response{
+				Message: xErrorHeader,
+				Status:  fmt.Sprintf("%s (%d)", resp.Status, resp.StatusCode),
+			}
+		}
+
+		fs.Errorf(resp, "RealDebrid error: %s", err.Error())
+
+		return err
+	}
+
 	if err != nil || body == nil {
 		return &api.Response{
 			Message: "Failed to read response body",
@@ -643,7 +678,7 @@ func (f *Fs) listAll(ctx context.Context, dirID string, directoriesOnly bool, fi
 						broken = true
 					}
 				}
-				if torrent.Status == "dead" || broken {
+				if (torrent.Status == "dead" || broken) && f.opt.RedownloadBrokenTorrents {
 					torrents[i] = f.redownloadTorrent(ctx, torrent)
 				}
 			}
@@ -753,7 +788,7 @@ func (f *Fs) listAll(ctx context.Context, dirID string, directoriesOnly bool, fi
 					ItemFile.Generated = torrent.Generated
 					result = append(result, ItemFile)
 				}
-				if broken {
+				if broken && f.opt.RedownloadBrokenTorrents {
 					torrents[i] = f.redownloadTorrent(ctx, torrent)
 					torrent = torrents[i]
 					for _, link := range torrent.Links {
@@ -1246,7 +1281,14 @@ func (o *Object) Open(ctx context.Context, options ...fs.OpenOption) (in io.Read
 		fs.Errorf(o, "error opening file: %q: %s", o.url, err)
 
 		if errCode == 503 {
-			o.addBrokenTorrent()
+			if resp != nil {
+				xErrorHeader := resp.Header.Get("X-Error")
+				if xErrorHeader != ErrorBytesLimitReached {
+					if o.fs.opt.RedownloadBrokenTorrents {
+						o.addBrokenTorrent()
+					}
+				}
+			}
 		}
 
 		return nil, err
