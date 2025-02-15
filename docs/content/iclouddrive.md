@@ -2,6 +2,7 @@
 title: "iCloud Drive"
 description: "Rclone docs for iCloud Drive"
 versionIntroduced: "v1.69"
+status: Beta
 ---
 
 # {{< icon "fa fa-cloud" >}} iCloud Drive
@@ -9,8 +10,11 @@ versionIntroduced: "v1.69"
 
 ## Configuration
 
-The initial setup for an iCloud Drive backend involves getting a trust token/session.
-`rclone config` walks you through it. The trust token is valid for 30 days. After which you will have to reauthenticate with rclone reconnect or rclone config.
+The initial setup for an iCloud Drive backend involves getting a trust token/session. This can be done by simply using the regular iCloud password, and accepting the code prompt on another iCloud connected device. 
+
+**IMPORTANT**: At the moment an app specific password won't be accepted. Only use your regular password and 2FA.
+
+`rclone config` walks you through the token creation. The trust token is valid for 30 days. After which you will have to reauthenticate with `rclone reconnect` or `rclone config`.
 
 Here is an example of how to make a remote called `iclouddrive`.  First run:
 
@@ -105,7 +109,7 @@ Properties:
 
 #### --iclouddrive-trust-token
 
-trust token (internal use)
+Trust token (internal use)
 
 Properties:
 
@@ -128,6 +132,17 @@ Properties:
 ### Advanced options
 
 Here are the Advanced options specific to iclouddrive (iCloud Drive).
+
+#### --iclouddrive-client-id
+
+Client id
+
+Properties:
+
+- Config:      client_id
+- Env Var:     RCLONE_ICLOUDDRIVE_CLIENT_ID
+- Type:        string
+- Default:     "d39ba9916b7251055b22c7f910e2ea796ee65e98b2ddecea8f5dde8d9d1a815d"
 
 #### --iclouddrive-encoding
 
