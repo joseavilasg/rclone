@@ -44,7 +44,6 @@ import (
 	"github.com/rclone/rclone/lib/oauthutil"
 	"github.com/rclone/rclone/lib/pacer"
 	"github.com/rclone/rclone/lib/rest"
-	"golang.org/x/oauth2"
 )
 
 const (
@@ -60,12 +59,10 @@ const (
 // Globals
 var (
 	// Description of how to auth for this app
-	oauthConfig = &oauth2.Config{
-		Scopes: nil,
-		Endpoint: oauth2.Endpoint{
-			AuthURL:  "https://api.real-debrid.com/oauth/v2/auth",
-			TokenURL: "https://api.real-debrid.com/oauth/v2/token",
-		},
+	oauthConfig = &oauthutil.Config{
+		Scopes:       nil,
+		TokenURL:     "https://api.real-debrid.com/oauth/v2/token",
+		AuthURL:      "https://api.real-debrid.com/oauth/v2/auth",
 		ClientID:     rcloneClientID,
 		ClientSecret: obscure.MustReveal(rcloneEncryptedClientSecret),
 		RedirectURL:  oauthutil.RedirectURL,
