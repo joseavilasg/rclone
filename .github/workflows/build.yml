@@ -6,7 +6,7 @@ on:
       - "**"
 
 env:
-  IMAGE: tgdrive/rclone
+  IMAGE: joseavilasg/rclone
 
 jobs:
   build:
@@ -20,14 +20,13 @@ jobs:
           - job_name: linux
             os: ubuntu-latest
             go: '~1.26.6'
-            go: "~1.26.0"
             gotags: cmount
             cgo: "0"
             build_flags: '-include "^(linux/amd64|linux/arm64|linux/arm-v7)"'
 
           - job_name: windows
             os: windows-latest
-            go: "~1.26.0"
+            go: "~1.26.6"
             gotags: cmount
             cgo: "0"
             build_flags: '-include "^(windows/amd64|windows/arm64)"'
@@ -35,13 +34,13 @@ jobs:
 
           - job_name: mac_amd64
             os: macos-latest
-            go: "~1.26.0"
+            go: "~1.26.6"
             gotags: "cmount"
             build_flags: '-include "^darwin/amd64" -cgo'
 
           - job_name: mac_arm64
             os: macos-latest
-            go: "~1.26.0"
+            go: "~1.26.6"
             gotags: "cmount"
             build_flags: '-include "^darwin/arm64" -cgo -macos-arch arm64 -cgo-cflags=-I/usr/local/include -cgo-ldflags=-L/usr/local/lib'
 
@@ -52,6 +51,7 @@ jobs:
     steps:
       - name: Get runner parameters
         id: get-runner-parameters
+        shell: bash
         run: |
           echo "year-week=$(date -u "+%Y%V")" >> $GITHUB_OUTPUT
           echo "runner-os-version=$ImageOS" >> $GITHUB_OUTPUT
@@ -74,6 +74,7 @@ jobs:
 
       - name: Get Go paths
         id: go-paths
+        shell: bash
         run: |
           echo "build-cache=$(go env GOCACHE)" >> $GITHUB_OUTPUT
           echo "mod-cache=$(go env GOMODCACHE)" >> $GITHUB_OUTPUT
@@ -182,6 +183,7 @@ jobs:
 
       - name: Trim module cache before saving
         if: always()
+        shell: bash
         run: |
           # The downloaded module .zip archives are not needed to build from
           # the already-extracted module cache, so drop them before the cache
@@ -309,7 +311,7 @@ jobs:
       - name: Publish Docker Plugin
         run: |
           VER=${GITHUB_REF_NAME}
-          PLUGIN_USER=ghcr.io/tgdrive
+          PLUGIN_USER=ghcr.io/joseavilasg
           for PLUGIN_ARCH in amd64 arm64 arm/v7 ;do
               export PLUGIN_ARCH
               export PLUGIN_USER
