@@ -55,6 +55,9 @@ const (
 
 	sessionIDConfigKey = "session_id"
 	masterKeyConfigKey = "master_key"
+
+	rdURL      = "https://api.real-debrid.com/rest/1.0"
+	rdHostName = "mega.co.nz"
 )
 
 var (
@@ -100,6 +103,30 @@ func init() {
 			Advanced:  true,
 			Sensitive: true,
 			Hide:      fs.OptionHideBoth,
+		}, {
+			Name:     "realdebrid_token",
+			Help:     "RealDebrid API Token, for faster downloads.",
+			Required: false,
+			Advanced: true,
+			Default:  "",
+		}, {
+			Name:     "realdebrid_remote",
+			Help:     "Whether to use RealDebrid remote traffic or not.",
+			Required: false,
+			Advanced: true,
+			Default:  false,
+		}, {
+			Name:     "realdebrid_ip",
+			Help:     "Allowed IP",
+			Required: false,
+			Advanced: true,
+			Default:  "",
+		}, {
+			Name:     "only_unrestrict_links",
+			Help:     "This will only unrestrict links and not download them.",
+			Required: false,
+			Advanced: true,
+			Default:  false,
 		}, {
 			Name: "debug",
 			Help: `Output more debug from Mega.
@@ -150,6 +177,11 @@ type Options struct {
 	HardDelete bool                 `config:"hard_delete"`
 	UseHTTPS   bool                 `config:"use_https"`
 	Enc        encoder.MultiEncoder `config:"encoding"`
+
+	RealDebridToken     string `config:"realdebrid_token"`
+	RealdebridRemote    bool   `config:"realdebrid_remote"`
+	RealdebridIP        string `config:"realdebrid_ip"`
+	OnlyUnrestrictLinks bool   `config:"only_unrestrict_links"`
 }
 
 // Fs represents a remote mega
