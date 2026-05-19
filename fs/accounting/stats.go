@@ -22,55 +22,61 @@ const (
 	averageStopAfter    = time.Minute
 )
 
-// MaxCompletedTransfers specifies maximum number of completed transfers in startedTransfers list
+// MaxCompletedTransfers specifies the default maximum number of
+// completed transfers in startedTransfers list. This can be adjusted
+// for a given StatsInfo by calling the SetMaxCompletedTransfers
+// method.
 var MaxCompletedTransfers = 100
 
 // StatsInfo accounts all transfers
 // N.B.: if this struct is modified, please remember to also update sum() function in stats_groups
 // to correctly count the updated fields
 type StatsInfo struct {
-	mu                  sync.RWMutex
-	ctx                 context.Context
-	ci                  *fs.ConfigInfo
-	bytes               int64
-	errors              int64
-	lastError           error
-	fatalError          bool
-	retryError          bool
-	retryAfter          time.Time
-	checks              int64
-	checking            *transferMap
-	checkQueue          int
-	checkQueueSize      int64
-	transfers           int64
-	transferring        *transferMap
-	transferQueue       int
-	transferQueueSize   int64
-	renames             int64
-	renameQueue         int
-	renameQueueSize     int64
-	deletes             int64
-	deletesSize         int64
-	deletedDirs         int64
-	inProgress          *inProgress
-	startedTransfers    []*Transfer   // currently active transfers
-	oldTimeRanges       timeRanges    // a merged list of time ranges for the transfers
-	oldDuration         time.Duration // duration of transfers we have culled
-	group               string
-	startTime           time.Time // the moment these stats were initialized or reset
-	average             averageValues
-	serverSideCopies    int64
-	serverSideCopyBytes int64
-	serverSideMoves     int64
-	serverSideMoveBytes int64
+	mu                    sync.RWMutex
+	ctx                   context.Context
+	ci                    *fs.ConfigInfo
+	bytes                 int64
+	errors                int64
+	lastError             error
+	fatalError            bool
+	retryError            bool
+	retryAfter            time.Time
+	checks                int64
+	checking              *transferMap
+	checkQueue            int
+	checkQueueSize        int64
+	transfers             int64
+	transferring          *transferMap
+	transferQueue         int
+	transferQueueSize     int64
+	listed                int64
+	renames               int64
+	renameQueue           int
+	renameQueueSize       int64
+	deletes               int64
+	deletesSize           int64
+	deletedDirs           int64
+	inProgress            *inProgress
+	startedTransfers      []*Transfer   // currently active transfers
+	oldTimeRanges         timeRanges    // a merged list of time ranges for the transfers
+	oldDuration           time.Duration // duration of transfers we have culled
+	group                 string
+	startTime             time.Time // the moment these stats were initialized or reset
+	average               averageValues
+	serverSideCopies      int64
+	serverSideCopyBytes   int64
+	serverSideMoves       int64
+	serverSideMoveBytes   int64
+	maxCompletedTransfers int
 }
 
 type averageValues struct {
 	mu      sync.Mutex
+	period  float64
 	lpBytes int64
 	lpTime  time.Time
 	speed   float64
-	stop    chan bool
+	cancel  context.CancelFunc
 	stopped sync.WaitGroup
 	started bool
 }
@@ -79,20 +85,30 @@ type averageValues struct {
 func NewStats(ctx context.Context) *StatsInfo {
 	ci := fs.GetConfig(ctx)
 	s := &StatsInfo{
-		ctx:          ctx,
-		ci:           ci,
-		checking:     newTransferMap(ci.Checkers, "checking"),
-		transferring: newTransferMap(ci.Transfers, "transferring"),
-		inProgress:   newInProgress(ctx),
-		startTime:    time.Now(),
-		average:      averageValues{},
+		ctx:                   ctx,
+		ci:                    ci,
+		checking:              newTransferMap(ci.Checkers, "checking"),
+		transferring:          newTransferMap(ci.Transfers, "transferring"),
+		inProgress:            newInProgress(ctx),
+		startTime:             time.Now(),
+		average:               averageValues{},
+		maxCompletedTransfers: MaxCompletedTransfers,
 	}
-	s.startAverageLoop()
+	return s
+}
+
+// SetMaxCompletedTransfers sets the maximum number of completed transfers to keep.
+func (s *StatsInfo) SetMaxCompletedTransfers(n int) *StatsInfo {
+	s.mu.Lock()
+	s.maxCompletedTransfers = n
+	s.mu.Unlock()
 	return s
 }
 
 // RemoteStats returns stats for rc
-func (s *StatsInfo) RemoteStats() (out rc.Params, err error) {
+//
+// If short is true then the transfers and checkers won't be added.
+func (s *StatsInfo) RemoteStats(short bool) (out rc.Params, err error) {
 	// NB if adding values here - make sure you update the docs in
 	// stats_groups.go
 
@@ -115,6 +131,7 @@ func (s *StatsInfo) RemoteStats() (out rc.Params, err error) {
 	out["deletes"] = s.deletes
 	out["deletedDirs"] = s.deletedDirs
 	out["renames"] = s.renames
+	out["listed"] = s.listed
 	out["elapsedTime"] = time.Since(s.startTime).Seconds()
 	out["serverSideCopies"] = s.serverSideCopies
 	out["serverSideCopyBytes"] = s.serverSideCopyBytes
@@ -128,10 +145,10 @@ func (s *StatsInfo) RemoteStats() (out rc.Params, err error) {
 	}
 	s.mu.RUnlock()
 
-	if !s.checking.empty() {
+	if !short && !s.checking.empty() {
 		out["checking"] = s.checking.remotes()
 	}
-	if !s.transferring.empty() {
+	if !short && !s.transferring.empty() {
 		out["transferring"] = s.transferring.rcStats(s.inProgress)
 	}
 	if s.errors > 0 {
@@ -324,26 +341,17 @@ func (s *StatsInfo) calculateTransferStats() (ts transferStats) {
 	return ts
 }
 
-func (s *StatsInfo) averageLoop() {
-	var period float64
-
+func (s *StatsInfo) averageLoop(ctx context.Context) {
 	ticker := time.NewTicker(averagePeriodLength)
 	defer ticker.Stop()
 
 	a := &s.average
 	defer a.stopped.Done()
 
-	shouldRun := false
-
 	for {
 		select {
 		case now := <-ticker.C:
 			a.mu.Lock()
-
-			if !shouldRun {
-				a.mu.Unlock()
-				continue
-			}
 
 			avg := 0.0
 			elapsed := now.Sub(a.lpTime).Seconds()
@@ -351,46 +359,21 @@ func (s *StatsInfo) averageLoop() {
 				avg = float64(a.lpBytes) / elapsed
 			}
 
-			if period < averagePeriod {
-				period++
+			if a.period < averagePeriod {
+				a.period++
 			}
 
-			a.speed = (avg + a.speed*(period-1)) / period
+			a.speed = (avg + a.speed*(a.period-1)) / a.period
 			a.lpBytes = 0
 			a.lpTime = now
 
 			a.mu.Unlock()
 
-		case stop, ok := <-a.stop:
-			if !ok {
-				return // Channel closed, exit the loop
-			}
-
-			a.mu.Lock()
-
-			// If we are resuming, store the current time
-			if !shouldRun && !stop {
-				a.lpTime = time.Now()
-			}
-			shouldRun = !stop
-
-			a.mu.Unlock()
+		case <-ctx.Done():
+			// Stop the loop
+			return
 		}
 	}
-}
-
-// Resume the average loop
-func (s *StatsInfo) resumeAverageLoop() {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.average.stop <- false
-}
-
-// Pause the average loop
-func (s *StatsInfo) pauseAverageLoop() {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.average.stop <- true
 }
 
 // Start the average loop
@@ -398,10 +381,12 @@ func (s *StatsInfo) pauseAverageLoop() {
 // Call with the mutex held
 func (s *StatsInfo) _startAverageLoop() {
 	if !s.average.started {
-		s.average.stop = make(chan bool)
+		ctx, cancel := context.WithCancel(context.Background())
+		s.average.cancel = cancel
 		s.average.started = true
 		s.average.stopped.Add(1)
-		go s.averageLoop()
+		s.average.lpTime = time.Now()
+		go s.averageLoop(ctx)
 	}
 }
 
@@ -417,8 +402,9 @@ func (s *StatsInfo) startAverageLoop() {
 // Call with the mutex held
 func (s *StatsInfo) _stopAverageLoop() {
 	if s.average.started {
-		close(s.average.stop)
+		s.average.cancel()
 		s.average.stopped.Wait()
+		s.average.started = false
 	}
 }
 
@@ -498,9 +484,9 @@ func (s *StatsInfo) String() string {
 			_, _ = fmt.Fprintf(buf, "Errors:        %10d%s\n",
 				s.errors, errorDetails)
 		}
-		if s.checks != 0 || ts.totalChecks != 0 {
-			_, _ = fmt.Fprintf(buf, "Checks:        %10d / %d, %s\n",
-				s.checks, ts.totalChecks, percent(s.checks, ts.totalChecks))
+		if s.checks != 0 || ts.totalChecks != 0 || s.listed != 0 {
+			_, _ = fmt.Fprintf(buf, "Checks:        %10d / %d, %s, Listed %d\n",
+				s.checks, ts.totalChecks, percent(s.checks, ts.totalChecks), s.listed)
 		}
 		if s.deletes != 0 || s.deletedDirs != 0 {
 			_, _ = fmt.Fprintf(buf, "Deleted:       %10d (files), %d (dirs), %s (freed)\n", s.deletes, s.deletedDirs, fs.SizeSuffix(s.deletesSize).ByteUnit())
@@ -561,7 +547,7 @@ func (s *StatsInfo) Transferred() []TransferSnapshot {
 // Log outputs the StatsInfo to the log
 func (s *StatsInfo) Log() {
 	if s.ci.UseJSONLog {
-		out, _ := s.RemoteStats()
+		out, _ := s.RemoteStats(false)
 		fs.LogLevelPrintf(s.ci.StatsLogLevel, nil, "%v%v\n", s, fs.LogValueHide("stats", out))
 	} else {
 		fs.LogLevelPrintf(s.ci.StatsLogLevel, nil, "%v\n", s)
@@ -716,7 +702,15 @@ func (s *StatsInfo) Renames(renames int64) int64 {
 	return s.renames
 }
 
-// ResetCounters sets the counters (bytes, checks, errors, transfers, deletes, renames) to 0 and resets lastError, fatalError and retryError
+// Listed updates the stats for listed objects
+func (s *StatsInfo) Listed(listed int64) int64 {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.listed += listed
+	return s.listed
+}
+
+// ResetCounters sets the counters (bytes, checks, errors, transfers, deletes, renames, listed) to 0 and resets lastError, fatalError and retryError
 func (s *StatsInfo) ResetCounters() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -732,6 +726,7 @@ func (s *StatsInfo) ResetCounters() {
 	s.deletesSize = 0
 	s.deletedDirs = 0
 	s.renames = 0
+	s.listed = 0
 	s.startedTransfers = nil
 	s.oldDuration = 0
 
@@ -826,7 +821,7 @@ func (s *StatsInfo) NewTransfer(obj fs.DirEntry, dstFs fs.Fs) *Transfer {
 	}
 	tr := newTransfer(s, obj, srcFs, dstFs)
 	s.transferring.add(tr)
-	s.resumeAverageLoop()
+	s.startAverageLoop()
 	return tr
 }
 
@@ -834,7 +829,7 @@ func (s *StatsInfo) NewTransfer(obj fs.DirEntry, dstFs fs.Fs) *Transfer {
 func (s *StatsInfo) NewTransferRemoteSize(remote string, size int64, srcFs, dstFs fs.Fs) *Transfer {
 	tr := newTransferRemoteSize(s, remote, size, false, "", srcFs, dstFs)
 	s.transferring.add(tr)
-	s.resumeAverageLoop()
+	s.startAverageLoop()
 	return tr
 }
 
@@ -849,7 +844,9 @@ func (s *StatsInfo) DoneTransferring(remote string, ok bool) {
 		s.mu.Unlock()
 	}
 	if s.transferring.empty() && s.checking.empty() {
-		s.pauseAverageLoop()
+		s.mu.Lock()
+		s._stopAverageLoop()
+		s.mu.Unlock()
 	}
 }
 
@@ -928,22 +925,31 @@ func (s *StatsInfo) RemoveTransfer(transfer *Transfer) {
 }
 
 // PruneTransfers makes sure there aren't too many old transfers by removing
-// single finished transfer.
-func (s *StatsInfo) PruneTransfers() {
-	if MaxCompletedTransfers < 0 {
-		return
-	}
+// a single finished transfer. Returns true if it removed a transfer.
+func (s *StatsInfo) PruneTransfers() bool {
 	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.maxCompletedTransfers < 0 {
+		return false
+	}
+	removed := false
 	// remove a transfer from the start if we are over quota
-	if len(s.startedTransfers) > MaxCompletedTransfers+s.ci.Transfers {
+	if len(s.startedTransfers) > s.maxCompletedTransfers+s.ci.Transfers {
 		for i, tr := range s.startedTransfers {
 			if tr.IsDone() {
 				s._removeTransfer(tr, i)
+				removed = true
 				break
 			}
 		}
 	}
-	s.mu.Unlock()
+	return removed
+}
+
+// RemoveDoneTransfers removes all Done transfers.
+func (s *StatsInfo) RemoveDoneTransfers() {
+	for s.PruneTransfers() {
+	}
 }
 
 // AddServerSideMove counts a server side move
@@ -951,6 +957,13 @@ func (s *StatsInfo) AddServerSideMove(n int64) {
 	s.mu.Lock()
 	s.serverSideMoves += 1
 	s.serverSideMoveBytes += n
+	s.mu.Unlock()
+}
+
+// AddServerSideCopyBytes adds bytes for a server side copy
+func (s *StatsInfo) AddServerSideCopyBytes(n int64) {
+	s.mu.Lock()
+	s.serverSideCopyBytes += n
 	s.mu.Unlock()
 }
 

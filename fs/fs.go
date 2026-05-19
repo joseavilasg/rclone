@@ -50,6 +50,7 @@ var (
 	ErrorNotImplemented              = errors.New("optional feature not implemented")
 	ErrorCommandNotFound             = errors.New("command not found")
 	ErrorFileNameTooLong             = errors.New("file name too long")
+	ErrorCantListRoot                = errors.New("can't list root")
 )
 
 // CheckClose is a utility function used to check the return from
@@ -77,7 +78,7 @@ func FileExists(ctx context.Context, fs Fs, remote string) (bool, error) {
 // GetModifyWindow calculates the maximum modify window between the given Fses
 // and the Config.ModifyWindow parameter.
 func GetModifyWindow(ctx context.Context, fss ...Info) time.Duration {
-	window := GetConfig(ctx).ModifyWindow
+	window := time.Duration(GetConfig(ctx).ModifyWindow)
 	for _, f := range fss {
 		if f != nil {
 			precision := f.Precision()

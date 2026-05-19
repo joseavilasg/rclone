@@ -7,6 +7,7 @@ import (
 	"context"
 	"encoding/json"
 	"io"
+	"math"
 	"time"
 
 	"github.com/rclone/rclone/fs/hash"
@@ -311,6 +312,7 @@ func DirectoryOptionalInterfaces(d Directory) (supported, unsupported []string) 
 type ListRCallback func(entries DirEntries) error
 
 // ListRFn is defines the call used to recursively list a directory
+// with ListR or page through a directory with ListP
 type ListRFn func(ctx context.Context, dir string, callback ListRCallback) error
 
 // Flagger describes the interface rclone config types flags must satisfy
@@ -326,7 +328,7 @@ type Flagger interface {
 // satisfy as non-pointers
 //
 // These are from pflag.Value and need to be tested against
-// non-pointer value due the the way the backend flags are inserted
+// non-pointer value due to the way the backend flags are inserted
 // into the flags.
 type FlaggerNP interface {
 	String() string
@@ -334,9 +336,15 @@ type FlaggerNP interface {
 }
 
 // NewUsageValue makes a valid value
-func NewUsageValue(value int64) *int64 {
+func NewUsageValue[T interface {
+	int64 | uint64 | float64
+}](value T) *int64 {
 	p := new(int64)
-	*p = value
+	if value > T(int64(math.MaxInt64)) {
+		*p = math.MaxInt64
+	} else {
+		*p = int64(value)
+	}
 	return p
 }
 

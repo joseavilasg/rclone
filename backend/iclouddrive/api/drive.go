@@ -252,18 +252,14 @@ func (d *DriveService) DownloadFile(ctx context.Context, url string, opt []fs.Op
 	}
 
 	resp, err := d.icloud.srv.Call(ctx, opts)
-	if err != nil {
-		// icloud has some weird http codes
-		if resp.StatusCode == 330 {
-			loc, err := resp.Location()
-			if err == nil {
-				return d.DownloadFile(ctx, loc.String(), opt)
-			}
+	// icloud has some weird http codes
+	if err != nil && resp != nil && resp.StatusCode == 330 {
+		loc, err := resp.Location()
+		if err == nil {
+			return d.DownloadFile(ctx, loc.String(), opt)
 		}
-
-		return resp, err
 	}
-	return d.icloud.srv.Call(ctx, opts)
+	return resp, err
 }
 
 // MoveItemToTrashByItemID moves an item to the trash based on the item ID.
@@ -603,7 +599,7 @@ type UpdateFileInfo struct {
 		Signature          string `json:"signature,omitempty"`
 		Size               int64  `json:"size,omitempty"`
 		WrappingKey        string `json:"wrapping_key,omitempty"`
-	} `json:"data,omitempty"`
+	} `json:"data"`
 	DocumentID string    `json:"document_id"`
 	FileFlags  FileFlags `json:"file_flags"`
 	Mtime      int64     `json:"mtime"`
@@ -631,7 +627,7 @@ func NewUpdateFileInfo() UpdateFileInfo {
 		FileFlags: FileFlags{
 			IsExecutable: true,
 			IsHidden:     false,
-			IsWritable:   false,
+			IsWritable:   true,
 		},
 	}
 }
@@ -853,10 +849,10 @@ type DriveItem struct {
 	NumberOfItems       int64        `json:"numberOfItems"`
 	Status              string       `json:"status"`
 	Extension           string       `json:"extension,omitempty"`
-	DateModified        time.Time    `json:"dateModified,omitempty"`
-	DateChanged         time.Time    `json:"dateChanged,omitempty"`
+	DateModified        time.Time    `json:"dateModified"`
+	DateChanged         time.Time    `json:"dateChanged"`
 	Size                int64        `json:"size,omitempty"`
-	LastOpenTime        time.Time    `json:"lastOpenTime,omitempty"`
+	LastOpenTime        time.Time    `json:"lastOpenTime"`
 	Urls                struct {
 		URLDownload string `json:"url_download"`
 	} `json:"urls"`

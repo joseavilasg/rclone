@@ -29,6 +29,7 @@ import (
 	"github.com/rclone/rclone/fs/config/obscure"
 	"github.com/rclone/rclone/fs/fspath"
 	"github.com/rclone/rclone/fs/hash"
+	"github.com/rclone/rclone/fs/list"
 	"github.com/rclone/rclone/fs/rc"
 	"github.com/rclone/rclone/fs/walk"
 	"github.com/rclone/rclone/lib/atexit"
@@ -683,7 +684,7 @@ func (f *Fs) rcFetch(ctx context.Context, in rc.Params) (rc.Params, error) {
 		start, end int64
 	}
 	parseChunks := func(ranges string) (crs []chunkRange, err error) {
-		for _, part := range strings.Split(ranges, ",") {
+		for part := range strings.SplitSeq(ranges, ",") {
 			var start, end int64 = 0, math.MaxInt64
 			switch ints := strings.Split(part, ":"); len(ints) {
 			case 1:
@@ -1086,7 +1087,7 @@ func (f *Fs) List(ctx context.Context, dir string) (entries fs.DirEntries, err e
 	return cachedEntries, nil
 }
 
-func (f *Fs) recurse(ctx context.Context, dir string, list *walk.ListRHelper) error {
+func (f *Fs) recurse(ctx context.Context, dir string, list *list.Helper) error {
 	entries, err := f.List(ctx, dir)
 	if err != nil {
 		return err
@@ -1138,7 +1139,7 @@ func (f *Fs) ListR(ctx context.Context, dir string, callback fs.ListRCallback) (
 	}
 
 	// if we're here, we're gonna do a standard recursive traversal and cache everything
-	list := walk.NewListRHelper(callback)
+	list := list.NewHelper(callback)
 	err = f.recurse(ctx, dir, list)
 	if err != nil {
 		return err

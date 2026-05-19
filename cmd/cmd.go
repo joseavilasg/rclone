@@ -288,7 +288,7 @@ func Run(Retry bool, showStats bool, cmd *cobra.Command, f func() error) {
 			accounting.GlobalStats().ResetErrors()
 		}
 		if ci.RetriesInterval > 0 {
-			time.Sleep(ci.RetriesInterval)
+			time.Sleep(time.Duration(ci.RetriesInterval))
 		}
 	}
 	stopStats()
@@ -361,9 +361,7 @@ func StartStats() func() {
 	}
 	stopStats := make(chan struct{})
 	var wg sync.WaitGroup
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
+	wg.Go(func() {
 		ticker := time.NewTicker(*statsInterval)
 		for {
 			select {
@@ -374,7 +372,7 @@ func StartStats() func() {
 				return
 			}
 		}
-	}()
+	})
 	return func() {
 		close(stopStats)
 		wg.Wait()

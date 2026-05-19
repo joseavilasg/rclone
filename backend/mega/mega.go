@@ -17,6 +17,7 @@ Improvements:
 
 import (
 	"context"
+	"encoding/base64"
 	"errors"
 	"fmt"
 	"io"
@@ -51,8 +52,9 @@ const (
 	maxSleep      = 2 * time.Second
 	eventWaitTime = 500 * time.Millisecond
 	decayConstant = 2 // bigger for slower decay, exponential
-	rdURL         = "https://api.real-debrid.com/rest/1.0"
-	rdHostName    = "mega.co.nz"
+
+	sessionIDConfigKey = "session_id"
+	masterKeyConfigKey = "master_key"
 )
 
 var (
@@ -81,29 +83,23 @@ func init() {
 			Required:   true,
 			IsPassword: true,
 		}, {
-			Name:     "realdebrid_token",
-			Help:     "RealDebrid API Token, for faster downloads.",
+			Name:     "2fa",
+			Help:     `The 2FA code of your MEGA account if the account is set up with one`,
 			Required: false,
-			Advanced: true,
-			Default:  "",
 		}, {
-			Name:     "realdebrid_remote",
-			Help:     "Whether to use RealDebrid remote traffic or not.",
-			Required: false,
-			Advanced: true,
-			Default:  false,
+			Name:      sessionIDConfigKey,
+			Help:      "Session (internal use only)",
+			Required:  false,
+			Advanced:  true,
+			Sensitive: true,
+			Hide:      fs.OptionHideBoth,
 		}, {
-			Name:     "realdebrid_ip",
-			Help:     "Allowed IP",
-			Required: false,
-			Advanced: true,
-			Default:  "",
-		}, {
-			Name:     "only_unrestrict_links",
-			Help:     "This will only unrestrict links and not download them.",
-			Required: false,
-			Advanced: true,
-			Default:  false,
+			Name:      masterKeyConfigKey,
+			Help:      "Master key (internal use only)",
+			Required:  false,
+			Advanced:  true,
+			Sensitive: true,
+			Hide:      fs.OptionHideBoth,
 		}, {
 			Name: "debug",
 			Help: `Output more debug from Mega.
@@ -145,16 +141,15 @@ Enabling it will increase CPU usage and add network overhead.`,
 
 // Options defines the configuration for this backend
 type Options struct {
-	User                string               `config:"user"`
-	Pass                string               `config:"pass"`
-	RealDebridToken     string               `config:"realdebrid_token"`
-	RealdebridRemote    bool                 `config:"realdebrid_remote"`
-	RealdebridIP        string               `config:"realdebrid_ip"`
-	OnlyUnrestrictLinks bool                 `config:"only_unrestrict_links"`
-	Debug               bool                 `config:"debug"`
-	HardDelete          bool                 `config:"hard_delete"`
-	UseHTTPS            bool                 `config:"use_https"`
-	Enc                 encoder.MultiEncoder `config:"encoding"`
+	User       string               `config:"user"`
+	Pass       string               `config:"pass"`
+	TwoFA      string               `config:"2fa"`
+	SessionID  string               `config:"session_id"`
+	MasterKey  string               `config:"master_key"`
+	Debug      bool                 `config:"debug"`
+	HardDelete bool                 `config:"hard_delete"`
+	UseHTTPS   bool                 `config:"use_https"`
+	Enc        encoder.MultiEncoder `config:"encoding"`
 }
 
 // Fs represents a remote mega
@@ -249,6 +244,19 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 	}
 	ci := fs.GetConfig(ctx)
 
+	// Create Fs
+	root = parsePath(root)
+	f := &Fs{
+		name:  name,
+		root:  root,
+		opt:   *opt,
+		pacer: fs.NewPacer(ctx, pacer.NewDefault(pacer.MinSleep(minSleep), pacer.MaxSleep(maxSleep), pacer.DecayConstant(decayConstant))),
+	}
+	f.features = (&fs.Features{
+		DuplicateFiles:          true,
+		CanHaveEmptyDirectories: true,
+	}).Fill(ctx, f)
+
 	// cache *mega.Mega on username so we can reuse and share
 	// them between remotes.  They are expensive to make as they
 	// contain all the objects and sharing the objects makes the
@@ -270,26 +278,29 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 			})
 		}
 
-		err := srv.Login(opt.User, opt.Pass)
-		if err != nil {
-			return nil, fmt.Errorf("couldn't login: %w", err)
+		if opt.SessionID == "" {
+			fs.Debugf(f, "Using username and password to initialize the Mega API")
+			err := srv.MultiFactorLogin(opt.User, opt.Pass, opt.TwoFA)
+			if err != nil {
+				return nil, fmt.Errorf("couldn't login: %w", err)
+			}
+			megaCache[opt.User] = srv
+			m.Set(sessionIDConfigKey, srv.GetSessionID())
+			encodedMasterKey := base64.StdEncoding.EncodeToString(srv.GetMasterKey())
+			m.Set(masterKeyConfigKey, encodedMasterKey)
+		} else {
+			fs.Debugf(f, "Using previously stored session ID and master key to initialize the Mega API")
+			decodedMasterKey, err := base64.StdEncoding.DecodeString(opt.MasterKey)
+			if err != nil {
+				return nil, fmt.Errorf("couldn't decode master key: %w", err)
+			}
+			err = srv.LoginWithKeys(opt.SessionID, decodedMasterKey)
+			if err != nil {
+				fs.Debugf(f, "login with previous auth keys failed: %v", err)
+			}
 		}
-		megaCache[opt.User] = srv
 	}
-
-	root = parsePath(root)
-	f := &Fs{
-		name:     name,
-		root:     root,
-		opt:      *opt,
-		srv:      srv,
-		rdClient: rest.NewClient(fshttp.NewClient(ctx)).SetRoot(rdURL),
-		pacer:    fs.NewPacer(ctx, pacer.NewDefault(pacer.MinSleep(minSleep), pacer.MaxSleep(maxSleep), pacer.DecayConstant(decayConstant))),
-	}
-	f.features = (&fs.Features{
-		DuplicateFiles:          true,
-		CanHaveEmptyDirectories: true,
-	}).Fill(ctx, f)
+	f.srv = srv
 
 	// Find the root node and check if it is a file or not
 	_, err = f.findRoot(ctx, false)
@@ -969,9 +980,9 @@ func (f *Fs) About(ctx context.Context) (*fs.Usage, error) {
 		return nil, fmt.Errorf("failed to get Mega Quota: %w", err)
 	}
 	usage := &fs.Usage{
-		Total: fs.NewUsageValue(int64(q.Mstrg)),           // quota of bytes that can be used
-		Used:  fs.NewUsageValue(int64(q.Cstrg)),           // bytes in use
-		Free:  fs.NewUsageValue(int64(q.Mstrg - q.Cstrg)), // bytes which can be uploaded before reaching the quota
+		Total: fs.NewUsageValue(q.Mstrg),           // quota of bytes that can be used
+		Used:  fs.NewUsageValue(q.Cstrg),           // bytes in use
+		Free:  fs.NewUsageValue(q.Mstrg - q.Cstrg), // bytes which can be uploaded before reaching the quota
 	}
 	return usage, nil
 }

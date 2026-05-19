@@ -154,6 +154,37 @@ func (os Options) NonDefault(m configmap.Getter) configmap.Simple {
 	return nonDefault
 }
 
+// NonDefaultRC discovers which config values aren't at their default
+//
+// It expects a pointer to the current config struct in opts.
+//
+// It returns the overridden config in rc config format.
+func (os Options) NonDefaultRC(opts any) (map[string]any, error) {
+	items, err := configstruct.Items(opts)
+	if err != nil {
+		return nil, err
+	}
+	itemsByName := map[string]*configstruct.Item{}
+	for i := range items {
+		item := &items[i]
+		itemsByName[item.Name] = item
+	}
+	var nonDefault = map[string]any{}
+	for i := range os {
+		opt := &os[i]
+		item, found := itemsByName[opt.Name]
+		if !found {
+			return nil, fmt.Errorf("key %q in OptionsInfo not found in Options struct", opt.Name)
+		}
+		value := fmt.Sprint(item.Value)
+		defaultValue := fmt.Sprint(opt.Default)
+		if value != defaultValue {
+			nonDefault[item.Field] = item.Value
+		}
+	}
+	return nonDefault, nil
+}
+
 // HasAdvanced discovers if any options have an Advanced setting
 func (os Options) HasAdvanced() bool {
 	for i := range os {
@@ -259,15 +290,27 @@ func (o *Option) IsDefault() bool {
 // String turns Option into a string
 func (o *Option) String() string {
 	v := o.GetValue()
-	if stringArray, isStringArray := v.([]string); isStringArray {
+	switch x := v.(type) {
+	case []string:
 		// Treat empty string array as empty string
 		// This is to make the default value of the option help nice
-		if len(stringArray) == 0 {
+		if len(x) == 0 {
 			return ""
 		}
 		// Encode string arrays as CSV
 		// The default Go encoding can't be decoded uniquely
-		return CommaSepList(stringArray).String()
+		return CommaSepList(x).String()
+	case SizeSuffix:
+		str := x.String()
+		// Suffix bare numbers with "B" unless they are 0
+		//
+		// This makes sure that fs.SizeSuffix roundtrips through string
+		if len(str) > 0 && str != "0" {
+			if lastDigit := str[len(str)-1]; lastDigit >= '0' && lastDigit <= '9' {
+				str += "B"
+			}
+		}
+		return str
 	}
 	return fmt.Sprint(v)
 }

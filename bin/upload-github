@@ -6,7 +6,7 @@
 
 set -e
 
-REPO="joseavilasg/rclone"
+REPO="tgdrive/rclone"
 
 if [ "$1" == "" ]; then
     echo "Syntax: $0 Version"

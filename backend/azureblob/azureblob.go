@@ -11,13 +11,11 @@ import (
 	"encoding/base64"
 	"encoding/binary"
 	"encoding/hex"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"maps"
 	"net/http"
-	"net/url"
-	"os"
 	"path"
 	"slices"
 	"sort"
@@ -28,29 +26,28 @@ import (
 
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore"
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore/policy"
-	"github.com/Azure/azure-sdk-for-go/sdk/azidentity"
 	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob/blob"
 	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob/bloberror"
 	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob/blockblob"
 	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob/container"
 	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob/sas"
 	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob/service"
+	"github.com/rclone/rclone/backend/azureblob/auth"
 	"github.com/rclone/rclone/fs"
 	"github.com/rclone/rclone/fs/chunksize"
 	"github.com/rclone/rclone/fs/config"
 	"github.com/rclone/rclone/fs/config/configmap"
 	"github.com/rclone/rclone/fs/config/configstruct"
-	"github.com/rclone/rclone/fs/config/obscure"
 	"github.com/rclone/rclone/fs/fserrors"
-	"github.com/rclone/rclone/fs/fshttp"
 	"github.com/rclone/rclone/fs/hash"
-	"github.com/rclone/rclone/fs/walk"
+	"github.com/rclone/rclone/fs/list"
 	"github.com/rclone/rclone/lib/atexit"
 	"github.com/rclone/rclone/lib/bucket"
 	"github.com/rclone/rclone/lib/encoder"
-	"github.com/rclone/rclone/lib/env"
 	"github.com/rclone/rclone/lib/multipart"
 	"github.com/rclone/rclone/lib/pacer"
+	"github.com/rclone/rclone/lib/pool"
+	"github.com/rclone/rclone/lib/transferaccounter"
 	"golang.org/x/sync/errgroup"
 )
 
@@ -67,11 +64,7 @@ const (
 	storageDefaultBaseURL = "blob.core.windows.net"
 	defaultChunkSize      = 4 * fs.Mebi
 	defaultAccessTier     = blob.AccessTier("") // FIXME AccessTierNone
-	// Default storage account, key and blob endpoint for emulator support,
-	// though it is a base64 key checked in here, it is publicly available secret.
-	emulatorAccount      = "devstoreaccount1"
-	emulatorAccountKey   = "Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw=="
-	emulatorBlobEndpoint = "http://127.0.0.1:10000/devstoreaccount1"
+	sasCopyValidity       = time.Hour           // how long SAS should last when doing server side copy
 )
 
 var (
@@ -84,205 +77,57 @@ var (
 	metadataMu sync.Mutex
 )
 
+// system metadata keys which this backend owns
+var systemMetadataInfo = map[string]fs.MetadataHelp{
+	"cache-control": {
+		Help:    "Cache-Control header",
+		Type:    "string",
+		Example: "no-cache",
+	},
+	"content-disposition": {
+		Help:    "Content-Disposition header",
+		Type:    "string",
+		Example: "inline",
+	},
+	"content-encoding": {
+		Help:    "Content-Encoding header",
+		Type:    "string",
+		Example: "gzip",
+	},
+	"content-language": {
+		Help:    "Content-Language header",
+		Type:    "string",
+		Example: "en-US",
+	},
+	"content-type": {
+		Help:    "Content-Type header",
+		Type:    "string",
+		Example: "text/plain",
+	},
+	"tier": {
+		Help:     "Tier of the object",
+		Type:     "string",
+		Example:  "Hot",
+		ReadOnly: true,
+	},
+	"mtime": {
+		Help:    "Time of last modification, read from rclone metadata",
+		Type:    "RFC 3339",
+		Example: "2006-01-02T15:04:05.999999999Z07:00",
+	},
+}
+
 // Register with Fs
 func init() {
 	fs.Register(&fs.RegInfo{
 		Name:        "azureblob",
 		Description: "Microsoft Azure Blob Storage",
 		NewFs:       NewFs,
-		Options: []fs.Option{{
-			Name: "account",
-			Help: `Azure Storage Account Name.
-
-Set this to the Azure Storage Account Name in use.
-
-Leave blank to use SAS URL or Emulator, otherwise it needs to be set.
-
-If this is blank and if env_auth is set it will be read from the
-environment variable ` + "`AZURE_STORAGE_ACCOUNT_NAME`" + ` if possible.
-`,
-			Sensitive: true,
-		}, {
-			Name: "env_auth",
-			Help: `Read credentials from runtime (environment variables, CLI or MSI).
-
-See the [authentication docs](/azureblob#authentication) for full info.`,
-			Default: false,
-		}, {
-			Name: "key",
-			Help: `Storage Account Shared Key.
-
-Leave blank to use SAS URL or Emulator.`,
-			Sensitive: true,
-		}, {
-			Name: "sas_url",
-			Help: `SAS URL for container level access only.
-
-Leave blank if using account/key or Emulator.`,
-			Sensitive: true,
-		}, {
-			Name: "tenant",
-			Help: `ID of the service principal's tenant. Also called its directory ID.
-
-Set this if using
-- Service principal with client secret
-- Service principal with certificate
-- User with username and password
-`,
-			Sensitive: true,
-		}, {
-			Name: "client_id",
-			Help: `The ID of the client in use.
-
-Set this if using
-- Service principal with client secret
-- Service principal with certificate
-- User with username and password
-`,
-			Sensitive: true,
-		}, {
-			Name: "client_secret",
-			Help: `One of the service principal's client secrets
-
-Set this if using
-- Service principal with client secret
-`,
-			Sensitive: true,
-		}, {
-			Name: "client_certificate_path",
-			Help: `Path to a PEM or PKCS12 certificate file including the private key.
-
-Set this if using
-- Service principal with certificate
-`,
-		}, {
-			Name: "client_certificate_password",
-			Help: `Password for the certificate file (optional).
-
-Optionally set this if using
-- Service principal with certificate
-
-And the certificate has a password.
-`,
-			IsPassword: true,
-		}, {
-			Name: "client_send_certificate_chain",
-			Help: `Send the certificate chain when using certificate auth.
-
-Specifies whether an authentication request will include an x5c header
-to support subject name / issuer based authentication. When set to
-true, authentication requests include the x5c header.
-
-Optionally set this if using
-- Service principal with certificate
-`,
-			Default:  false,
-			Advanced: true,
-		}, {
-			Name: "username",
-			Help: `User name (usually an email address)
-
-Set this if using
-- User with username and password
-`,
-			Advanced:  true,
-			Sensitive: true,
-		}, {
-			Name: "password",
-			Help: `The user's password
-
-Set this if using
-- User with username and password
-`,
-			IsPassword: true,
-			Advanced:   true,
-		}, {
-			Name: "service_principal_file",
-			Help: `Path to file containing credentials for use with a service principal.
-
-Leave blank normally. Needed only if you want to use a service principal instead of interactive login.
-
-    $ az ad sp create-for-rbac --name "<name>" \
-      --role "Storage Blob Data Owner" \
-      --scopes "/subscriptions/<subscription>/resourceGroups/<resource-group>/providers/Microsoft.Storage/storageAccounts/<storage-account>/blobServices/default/containers/<container>" \
-      > azure-principal.json
-
-See ["Create an Azure service principal"](https://docs.microsoft.com/en-us/cli/azure/create-an-azure-service-principal-azure-cli) and ["Assign an Azure role for access to blob data"](https://docs.microsoft.com/en-us/azure/storage/common/storage-auth-aad-rbac-cli) pages for more details.
-
-It may be more convenient to put the credentials directly into the
-rclone config file under the ` + "`client_id`, `tenant` and `client_secret`" + `
-keys instead of setting ` + "`service_principal_file`" + `.
-`,
-			Advanced: true,
-		}, {
-			Name: "disable_instance_discovery",
-			Help: `Skip requesting Microsoft Entra instance metadata
-
-This should be set true only by applications authenticating in
-disconnected clouds, or private clouds such as Azure Stack.
-
-It determines whether rclone requests Microsoft Entra instance
-metadata from ` + "`https://login.microsoft.com/`" + ` before
-authenticating.
-
-Setting this to true will skip this request, making you responsible
-for ensuring the configured authority is valid and trustworthy.
-`,
-			Default:  false,
-			Advanced: true,
-		}, {
-			Name: "use_msi",
-			Help: `Use a managed service identity to authenticate (only works in Azure).
-
-When true, use a [managed service identity](https://docs.microsoft.com/en-us/azure/active-directory/managed-identities-azure-resources/)
-to authenticate to Azure Storage instead of a SAS token or account key.
-
-If the VM(SS) on which this program is running has a system-assigned identity, it will
-be used by default. If the resource has no system-assigned but exactly one user-assigned identity,
-the user-assigned identity will be used by default. If the resource has multiple user-assigned
-identities, the identity to use must be explicitly specified using exactly one of the msi_object_id,
-msi_client_id, or msi_mi_res_id parameters.`,
-			Default:  false,
-			Advanced: true,
-		}, {
-			Name:      "msi_object_id",
-			Help:      "Object ID of the user-assigned MSI to use, if any.\n\nLeave blank if msi_client_id or msi_mi_res_id specified.",
-			Advanced:  true,
-			Sensitive: true,
-		}, {
-			Name:      "msi_client_id",
-			Help:      "Object ID of the user-assigned MSI to use, if any.\n\nLeave blank if msi_object_id or msi_mi_res_id specified.",
-			Advanced:  true,
-			Sensitive: true,
-		}, {
-			Name:      "msi_mi_res_id",
-			Help:      "Azure resource ID of the user-assigned MSI to use, if any.\n\nLeave blank if msi_client_id or msi_object_id specified.",
-			Advanced:  true,
-			Sensitive: true,
-		}, {
-			Name:     "use_emulator",
-			Help:     "Uses local storage emulator if provided as 'true'.\n\nLeave blank if using real azure storage endpoint.",
-			Default:  false,
-			Advanced: true,
-		}, {
-			Name: "use_az",
-			Help: `Use Azure CLI tool az for authentication
-
-Set to use the [Azure CLI tool az](https://learn.microsoft.com/en-us/cli/azure/)
-as the sole means of authentication.
-
-Setting this can be useful if you wish to use the az CLI on a host with
-a System Managed Identity that you do not want to use.
-
-Don't set env_auth at the same time.
-`,
-			Default:  false,
-			Advanced: true,
-		}, {
-			Name:     "endpoint",
-			Help:     "Endpoint for the service.\n\nLeave blank normally.",
-			Advanced: true,
-		}, {
+		MetadataInfo: &fs.MetadataInfo{
+			System: systemMetadataInfo,
+			Help:   `User metadata is stored as x-ms-meta- keys. Azure metadata keys are case insensitive and are always returned in lower case.`,
+		},
+		Options: slices.Concat(auth.ConfigOptions, []fs.Option{{
 			Name:     "upload_cutoff",
 			Help:     "Cutoff for switching to chunked upload (<= 256 MiB) (deprecated).",
 			Advanced: true,
@@ -340,6 +185,16 @@ https://learn.microsoft.com/en-us/azure/storage/common/storage-use-azcopy-optimi
 In tests, copy speed increases almost linearly with copy
 concurrency.`,
 			Default:  512,
+			Advanced: true,
+		}, {
+			Name: "copy_total_concurrency",
+			Help: `Global concurrency limit for multipart copy chunks.
+
+This limits the total number of multipart copy chunks running at once
+across all files.
+
+Set to 0 to disable this limiter.`,
+			Default:  0,
 			Advanced: true,
 		}, {
 			Name: "use_copy_blob",
@@ -495,70 +350,57 @@ rclone does if you know the container exists already.
 			Default:   "",
 			Exclusive: true,
 			Advanced:  true,
-		}},
+		}}),
 	})
 }
 
 // Options defines the configuration for this backend
 type Options struct {
-	Account                    string               `config:"account"`
-	EnvAuth                    bool                 `config:"env_auth"`
-	Key                        string               `config:"key"`
-	SASURL                     string               `config:"sas_url"`
-	Tenant                     string               `config:"tenant"`
-	ClientID                   string               `config:"client_id"`
-	ClientSecret               string               `config:"client_secret"`
-	ClientCertificatePath      string               `config:"client_certificate_path"`
-	ClientCertificatePassword  string               `config:"client_certificate_password"`
-	ClientSendCertificateChain bool                 `config:"client_send_certificate_chain"`
-	Username                   string               `config:"username"`
-	Password                   string               `config:"password"`
-	ServicePrincipalFile       string               `config:"service_principal_file"`
-	DisableInstanceDiscovery   bool                 `config:"disable_instance_discovery"`
-	UseMSI                     bool                 `config:"use_msi"`
-	MSIObjectID                string               `config:"msi_object_id"`
-	MSIClientID                string               `config:"msi_client_id"`
-	MSIResourceID              string               `config:"msi_mi_res_id"`
-	UseAZ                      bool                 `config:"use_az"`
-	Endpoint                   string               `config:"endpoint"`
-	ChunkSize                  fs.SizeSuffix        `config:"chunk_size"`
-	CopyCutoff                 fs.SizeSuffix        `config:"copy_cutoff"`
-	CopyConcurrency            int                  `config:"copy_concurrency"`
-	UseCopyBlob                bool                 `config:"use_copy_blob"`
-	UploadConcurrency          int                  `config:"upload_concurrency"`
-	ListChunkSize              uint                 `config:"list_chunk"`
-	AccessTier                 string               `config:"access_tier"`
-	ArchiveTierDelete          bool                 `config:"archive_tier_delete"`
-	UseEmulator                bool                 `config:"use_emulator"`
-	DisableCheckSum            bool                 `config:"disable_checksum"`
-	Enc                        encoder.MultiEncoder `config:"encoding"`
-	PublicAccess               string               `config:"public_access"`
-	DirectoryMarkers           bool                 `config:"directory_markers"`
-	NoCheckContainer           bool                 `config:"no_check_container"`
-	NoHeadObject               bool                 `config:"no_head_object"`
-	DeleteSnapshots            string               `config:"delete_snapshots"`
+	auth.Options
+	ChunkSize            fs.SizeSuffix        `config:"chunk_size"`
+	CopyCutoff           fs.SizeSuffix        `config:"copy_cutoff"`
+	CopyConcurrency      int                  `config:"copy_concurrency"`
+	CopyTotalConcurrency int                  `config:"copy_total_concurrency"`
+	UseCopyBlob          bool                 `config:"use_copy_blob"`
+	UploadConcurrency    int                  `config:"upload_concurrency"`
+	ListChunkSize        uint                 `config:"list_chunk"`
+	AccessTier           string               `config:"access_tier"`
+	ArchiveTierDelete    bool                 `config:"archive_tier_delete"`
+	DisableCheckSum      bool                 `config:"disable_checksum"`
+	Enc                  encoder.MultiEncoder `config:"encoding"`
+	PublicAccess         string               `config:"public_access"`
+	DirectoryMarkers     bool                 `config:"directory_markers"`
+	NoCheckContainer     bool                 `config:"no_check_container"`
+	NoHeadObject         bool                 `config:"no_head_object"`
+	DeleteSnapshots      string               `config:"delete_snapshots"`
 }
 
 // Fs represents a remote azure server
 type Fs struct {
-	name          string                       // name of this remote
-	root          string                       // the path we are working on if any
-	opt           Options                      // parsed config options
-	ci            *fs.ConfigInfo               // global config
-	features      *fs.Features                 // optional features
-	cntSVCcacheMu sync.Mutex                   // mutex to protect cntSVCcache
-	cntSVCcache   map[string]*container.Client // reference to containerClient per container
-	svc           *service.Client              // client to access azblob
-	cred          azcore.TokenCredential       // how to generate tokens (may be nil)
-	sharedKeyCred *service.SharedKeyCredential // shared key credentials (may be nil)
-	anonymous     bool                         // if this is anonymous access
-	rootContainer string                       // container part of root (if any)
-	rootDirectory string                       // directory part of root (if any)
-	isLimited     bool                         // if limited to one container
-	cache         *bucket.Cache                // cache for container creation status
-	pacer         *fs.Pacer                    // To pace and retry the API calls
-	uploadToken   *pacer.TokenDispenser        // control concurrency
-	publicAccess  container.PublicAccessType   // Container Public Access Level
+	name               string                       // name of this remote
+	root               string                       // the path we are working on if any
+	opt                Options                      // parsed config options
+	ci                 *fs.ConfigInfo               // global config
+	features           *fs.Features                 // optional features
+	cntSVCcacheMu      sync.Mutex                   // mutex to protect cntSVCcache
+	cntSVCcache        map[string]*container.Client // reference to containerClient per container
+	svc                *service.Client              // client to access azblob
+	cred               azcore.TokenCredential       // how to generate tokens (may be nil)
+	usingSharedKeyCred bool                         // set if using shared key credentials
+	anonymous          bool                         // if this is anonymous access
+	rootContainer      string                       // container part of root (if any)
+	rootDirectory      string                       // directory part of root (if any)
+	isLimited          bool                         // if limited to one container
+	cache              *bucket.Cache                // cache for container creation status
+	pacer              *fs.Pacer                    // To pace and retry the API calls
+	uploadToken        *pacer.TokenDispenser        // control concurrency
+	copyToken          *pacer.TokenDispenser        // global multipart copy concurrency limiter
+	publicAccess       container.PublicAccessType   // Container Public Access Level
+
+	// user delegation cache
+	userDelegationMu     sync.Mutex
+	userDelegation       *service.UserDelegationCredential
+	userDelegationExpiry time.Time
 }
 
 // Object describes an azure object
@@ -612,6 +454,9 @@ func parsePath(path string) (root string) {
 // relative to f.root
 func (f *Fs) split(rootRelativePath string) (containerName, containerPath string) {
 	containerName, containerPath = bucket.Split(bucket.Join(f.root, rootRelativePath))
+	if f.opt.DirectoryMarkers && strings.HasSuffix(containerPath, "//") {
+		containerPath = containerPath[:len(containerPath)-1]
+	}
 	return f.opt.Enc.FromStandardName(containerName), f.opt.Enc.FromStandardPath(containerPath)
 }
 
@@ -713,47 +558,10 @@ func (f *Fs) setCopyCutoff(cs fs.SizeSuffix) (old fs.SizeSuffix, err error) {
 	return
 }
 
-type servicePrincipalCredentials struct {
-	AppID    string `json:"appId"`
-	Password string `json:"password"`
-	Tenant   string `json:"tenant"`
-}
-
-// parseServicePrincipalCredentials unmarshals a service principal credentials JSON file as generated by az cli.
-func parseServicePrincipalCredentials(ctx context.Context, credentialsData []byte) (*servicePrincipalCredentials, error) {
-	var spCredentials servicePrincipalCredentials
-	if err := json.Unmarshal(credentialsData, &spCredentials); err != nil {
-		return nil, fmt.Errorf("error parsing credentials from JSON file: %w", err)
-	}
-	// TODO: support certificate credentials
-	// Validate all fields present
-	if spCredentials.AppID == "" || spCredentials.Password == "" || spCredentials.Tenant == "" {
-		return nil, fmt.Errorf("missing fields in credentials file")
-	}
-	return &spCredentials, nil
-}
-
 // setRoot changes the root of the Fs
 func (f *Fs) setRoot(root string) {
 	f.root = parsePath(root)
 	f.rootContainer, f.rootDirectory = bucket.Split(f.root)
-}
-
-// Wrap the http.Transport to satisfy the Transporter interface
-type transporter struct {
-	http.RoundTripper
-}
-
-// Make a new transporter
-func newTransporter(ctx context.Context) transporter {
-	return transporter{
-		RoundTripper: fshttp.NewTransport(ctx),
-	}
-}
-
-// Do sends the HTTP request and returns the HTTP response or error.
-func (tr transporter) Do(req *http.Request) (*http.Response, error) {
-	return tr.RoundTripper.RoundTrip(req)
 }
 
 // NewFs constructs an Fs from the path, container:path
@@ -792,6 +600,7 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 		ci:          ci,
 		pacer:       fs.NewPacer(ctx, pacer.NewS3(pacer.MinSleep(minSleep), pacer.MaxSleep(maxSleep), pacer.DecayConstant(decayConstant))),
 		uploadToken: pacer.NewTokenDispenser(ci.Transfers),
+		copyToken:   pacer.NewTokenDispenser(opt.CopyTotalConcurrency),
 		cache:       bucket.NewCache(),
 		cntSVCcache: make(map[string]*container.Client, 1),
 	}
@@ -800,6 +609,9 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 	f.features = (&fs.Features{
 		ReadMimeType:            true,
 		WriteMimeType:           true,
+		ReadMetadata:            true,
+		WriteMetadata:           true,
+		UserMetadata:            true,
 		BucketBased:             true,
 		BucketBasedRootOK:       true,
 		SetTier:                 true,
@@ -812,222 +624,32 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 		fs.Debugf(f, "Using directory markers")
 	}
 
-	// Client options specifying our own transport
-	policyClientOptions := policy.ClientOptions{
-		Transport: newTransporter(ctx),
+	conf := auth.NewClientOpts[service.Client, service.ClientOptions, service.SharedKeyCredential]{
+		DefaultBaseURL:                   storageDefaultBaseURL,
+		RootContainer:                    f.rootContainer,
+		Blob:                             true,
+		NewClient:                        service.NewClient,
+		NewClientFromConnectionString:    service.NewClientFromConnectionString,
+		NewClientWithNoCredential:        service.NewClientWithNoCredential,
+		NewClientWithSharedKeyCredential: service.NewClientWithSharedKeyCredential,
+		NewSharedKeyCredential:           service.NewSharedKeyCredential,
+		SetClientOptions: func(options *service.ClientOptions, policyClientOptions policy.ClientOptions) {
+			options.ClientOptions = policyClientOptions
+		},
 	}
-	clientOpt := service.ClientOptions{
-		ClientOptions: policyClientOptions,
+	res, err := auth.NewClient(ctx, conf, &opt.Options)
+	if err != nil {
+		return nil, err
 	}
+	f.svc = res.Client
+	f.cred = res.Cred
+	f.usingSharedKeyCred = res.UsingSharedKeyCred
+	f.anonymous = res.Anonymous
 
-	// Here we auth by setting one of f.cred, f.sharedKeyCred, f.svc or f.anonymous
-	switch {
-	case opt.EnvAuth:
-		// Read account from environment if needed
-		if opt.Account == "" {
-			opt.Account, _ = os.LookupEnv("AZURE_STORAGE_ACCOUNT_NAME")
-		}
-		// Read credentials from the environment
-		options := azidentity.DefaultAzureCredentialOptions{
-			ClientOptions:            policyClientOptions,
-			DisableInstanceDiscovery: opt.DisableInstanceDiscovery,
-		}
-		f.cred, err = azidentity.NewDefaultAzureCredential(&options)
-		if err != nil {
-			return nil, fmt.Errorf("create azure environment credential failed: %w", err)
-		}
-	case opt.UseEmulator:
-		if opt.Account == "" {
-			opt.Account = emulatorAccount
-		}
-		if opt.Key == "" {
-			opt.Key = emulatorAccountKey
-		}
-		if opt.Endpoint == "" {
-			opt.Endpoint = emulatorBlobEndpoint
-		}
-		f.sharedKeyCred, err = service.NewSharedKeyCredential(opt.Account, opt.Key)
-		if err != nil {
-			return nil, fmt.Errorf("create new shared key credential for emulator failed: %w", err)
-		}
-	case opt.Account != "" && opt.Key != "":
-		f.sharedKeyCred, err = service.NewSharedKeyCredential(opt.Account, opt.Key)
-		if err != nil {
-			return nil, fmt.Errorf("create new shared key credential failed: %w", err)
-		}
-	case opt.SASURL != "":
-		parts, err := sas.ParseURL(opt.SASURL)
-		if err != nil {
-			return nil, fmt.Errorf("failed to parse SAS URL: %w", err)
-		}
-		endpoint := opt.SASURL
-		containerName := parts.ContainerName
-		// Check if we have container level SAS or account level SAS
-		if containerName != "" {
-			// Container level SAS
-			if f.rootContainer != "" && containerName != f.rootContainer {
-				return nil, fmt.Errorf("container name in SAS URL (%q) and container provided in command (%q) do not match", containerName, f.rootContainer)
-			}
-			// Rewrite the endpoint string to be without the container
-			parts.ContainerName = ""
-			endpoint = parts.String()
-		}
-		f.svc, err = service.NewClientWithNoCredential(endpoint, &clientOpt)
-		if err != nil {
-			return nil, fmt.Errorf("unable to create SAS URL client: %w", err)
-		}
-		// if using Container level SAS put the container client into the cache
-		if containerName != "" {
-			_ = f.cntSVC(containerName)
-			f.isLimited = true
-		}
-	case opt.ClientID != "" && opt.Tenant != "" && opt.ClientSecret != "":
-		// Service principal with client secret
-		options := azidentity.ClientSecretCredentialOptions{
-			ClientOptions: policyClientOptions,
-		}
-		f.cred, err = azidentity.NewClientSecretCredential(opt.Tenant, opt.ClientID, opt.ClientSecret, &options)
-		if err != nil {
-			return nil, fmt.Errorf("error creating a client secret credential: %w", err)
-		}
-	case opt.ClientID != "" && opt.Tenant != "" && opt.ClientCertificatePath != "":
-		// Service principal with certificate
-		//
-		// Read the certificate
-		data, err := os.ReadFile(env.ShellExpand(opt.ClientCertificatePath))
-		if err != nil {
-			return nil, fmt.Errorf("error reading client certificate file: %w", err)
-		}
-		// NewClientCertificateCredential requires at least one *x509.Certificate, and a
-		// crypto.PrivateKey.
-		//
-		// ParseCertificates returns these given certificate data in PEM or PKCS12 format.
-		// It handles common scenarios but has limitations, for example it doesn't load PEM
-		// encrypted private keys.
-		var password []byte
-		if opt.ClientCertificatePassword != "" {
-			pw, err := obscure.Reveal(opt.Password)
-			if err != nil {
-				return nil, fmt.Errorf("certificate password decode failed - did you obscure it?: %w", err)
-			}
-			password = []byte(pw)
-		}
-		certs, key, err := azidentity.ParseCertificates(data, password)
-		if err != nil {
-			return nil, fmt.Errorf("failed to parse client certificate file: %w", err)
-		}
-		options := azidentity.ClientCertificateCredentialOptions{
-			ClientOptions:        policyClientOptions,
-			SendCertificateChain: opt.ClientSendCertificateChain,
-		}
-		f.cred, err = azidentity.NewClientCertificateCredential(
-			opt.Tenant, opt.ClientID, certs, key, &options,
-		)
-		if err != nil {
-			return nil, fmt.Errorf("create azure service principal with client certificate credential failed: %w", err)
-		}
-	case opt.ClientID != "" && opt.Tenant != "" && opt.Username != "" && opt.Password != "":
-		// User with username and password
-		options := azidentity.UsernamePasswordCredentialOptions{
-			ClientOptions: policyClientOptions,
-		}
-		password, err := obscure.Reveal(opt.Password)
-		if err != nil {
-			return nil, fmt.Errorf("user password decode failed - did you obscure it?: %w", err)
-		}
-		f.cred, err = azidentity.NewUsernamePasswordCredential(
-			opt.Tenant, opt.ClientID, opt.Username, password, &options,
-		)
-		if err != nil {
-			return nil, fmt.Errorf("authenticate user with password failed: %w", err)
-		}
-	case opt.ServicePrincipalFile != "":
-		// Loading service principal credentials from file.
-		loadedCreds, err := os.ReadFile(env.ShellExpand(opt.ServicePrincipalFile))
-		if err != nil {
-			return nil, fmt.Errorf("error opening service principal credentials file: %w", err)
-		}
-		parsedCreds, err := parseServicePrincipalCredentials(ctx, loadedCreds)
-		if err != nil {
-			return nil, fmt.Errorf("error parsing service principal credentials file: %w", err)
-		}
-		options := azidentity.ClientSecretCredentialOptions{
-			ClientOptions: policyClientOptions,
-		}
-		f.cred, err = azidentity.NewClientSecretCredential(parsedCreds.Tenant, parsedCreds.AppID, parsedCreds.Password, &options)
-		if err != nil {
-			return nil, fmt.Errorf("error creating a client secret credential: %w", err)
-		}
-	case opt.UseMSI:
-		// Specifying a user-assigned identity. Exactly one of the above IDs must be specified.
-		// Validate and ensure exactly one is set. (To do: better validation.)
-		var b2i = map[bool]int{false: 0, true: 1}
-		set := b2i[opt.MSIClientID != ""] + b2i[opt.MSIObjectID != ""] + b2i[opt.MSIResourceID != ""]
-		if set > 1 {
-			return nil, errors.New("more than one user-assigned identity ID is set")
-		}
-		var options azidentity.ManagedIdentityCredentialOptions
-		switch {
-		case opt.MSIClientID != "":
-			options.ID = azidentity.ClientID(opt.MSIClientID)
-		case opt.MSIObjectID != "":
-			// FIXME this doesn't appear to be in the new SDK?
-			return nil, fmt.Errorf("MSI object ID is currently unsupported")
-		case opt.MSIResourceID != "":
-			options.ID = azidentity.ResourceID(opt.MSIResourceID)
-		}
-		f.cred, err = azidentity.NewManagedIdentityCredential(&options)
-		if err != nil {
-			return nil, fmt.Errorf("failed to acquire MSI token: %w", err)
-		}
-	case opt.UseAZ:
-		var options = azidentity.AzureCLICredentialOptions{}
-		f.cred, err = azidentity.NewAzureCLICredential(&options)
-		if err != nil {
-			return nil, fmt.Errorf("failed to create Azure CLI credentials: %w", err)
-		}
-	case opt.Account != "":
-		// Anonymous access
-		f.anonymous = true
-	default:
-		return nil, errors.New("no authentication method configured")
-	}
-
-	// Make the client if not already created
-	if f.svc == nil {
-		// Work out what the endpoint is if it is still unset
-		if opt.Endpoint == "" {
-			if opt.Account == "" {
-				return nil, fmt.Errorf("account must be set: can't make service URL")
-			}
-			u, err := url.Parse(fmt.Sprintf("https://%s.%s", opt.Account, storageDefaultBaseURL))
-			if err != nil {
-				return nil, fmt.Errorf("failed to make azure storage URL from account: %w", err)
-			}
-			opt.Endpoint = u.String()
-		}
-		if f.sharedKeyCred != nil {
-			// Shared key cred
-			f.svc, err = service.NewClientWithSharedKeyCredential(opt.Endpoint, f.sharedKeyCred, &clientOpt)
-			if err != nil {
-				return nil, fmt.Errorf("create client with shared key failed: %w", err)
-			}
-		} else if f.cred != nil {
-			// Azidentity cred
-			f.svc, err = service.NewClient(opt.Endpoint, f.cred, &clientOpt)
-			if err != nil {
-				return nil, fmt.Errorf("create client failed: %w", err)
-			}
-		} else if f.anonymous {
-			// Anonymous public access
-			f.svc, err = service.NewClientWithNoCredential(opt.Endpoint, &clientOpt)
-			if err != nil {
-				return nil, fmt.Errorf("create public client failed: %w", err)
-			}
-		}
-	}
-	if f.svc == nil {
-		return nil, fmt.Errorf("internal error: auth failed to make credentials or client")
+	// if using Container level SAS put the container client into the cache
+	if opt.SASURL != "" && res.Container != "" {
+		_ = f.cntSVC(res.Container)
+		f.isLimited = true
 	}
 
 	if f.rootContainer != "" && f.rootDirectory != "" {
@@ -1112,6 +734,285 @@ func (o *Object) updateMetadataWithModTime(modTime time.Time) {
 
 	// Set modTimeKey in it
 	o.meta[modTimeKey] = modTime.Format(timeFormatOut)
+}
+
+// parseXMsTags parses the value of the x-ms-tags header into a map.
+// It expects comma-separated key=value pairs. Whitespace around keys and
+// values is trimmed. Empty pairs and empty keys are rejected.
+func parseXMsTags(s string) (map[string]string, error) {
+	if strings.TrimSpace(s) == "" {
+		return map[string]string{}, nil
+	}
+	out := make(map[string]string)
+	parts := strings.SplitSeq(s, ",")
+	for p := range parts {
+		p = strings.TrimSpace(p)
+		if p == "" {
+			continue
+		}
+		kv := strings.SplitN(p, "=", 2)
+		if len(kv) != 2 {
+			return nil, fmt.Errorf("invalid tag %q", p)
+		}
+		k := strings.TrimSpace(kv[0])
+		v := strings.TrimSpace(kv[1])
+		if k == "" {
+			return nil, fmt.Errorf("invalid tag key in %q", p)
+		}
+		out[k] = v
+	}
+	return out, nil
+}
+
+// mapMetadataToAzure maps a generic metadata map to Azure HTTP headers,
+// user metadata, tags and optional modTime override.
+// Reserved x-ms-* keys (except x-ms-tags) are ignored for user metadata.
+//
+// Pass a logger to surface non-fatal parsing issues (e.g. bad mtime).
+func mapMetadataToAzure(meta map[string]string, logf func(string, ...any)) (headers blob.HTTPHeaders, userMeta map[string]*string, tags map[string]string, modTime *time.Time, err error) {
+	if meta == nil {
+		return headers, nil, nil, nil, nil
+	}
+	tmp := make(map[string]string)
+	for k, v := range meta {
+		lowerKey := strings.ToLower(k)
+		switch lowerKey {
+		case "cache-control":
+			headers.BlobCacheControl = pString(v)
+		case "content-disposition":
+			headers.BlobContentDisposition = pString(v)
+		case "content-encoding":
+			headers.BlobContentEncoding = pString(v)
+		case "content-language":
+			headers.BlobContentLanguage = pString(v)
+		case "content-type":
+			headers.BlobContentType = pString(v)
+		case "x-ms-tags":
+			parsed, perr := parseXMsTags(v)
+			if perr != nil {
+				return headers, nil, nil, nil, perr
+			}
+			// allocate only if there are tags
+			if len(parsed) > 0 {
+				tags = parsed
+			}
+		case "mtime":
+			// Accept multiple layouts for tolerance
+			var parsed time.Time
+			var pErr error
+			for _, layout := range []string{time.RFC3339Nano, time.RFC3339, timeFormatOut} {
+				parsed, pErr = time.Parse(layout, v)
+				if pErr == nil {
+					modTime = &parsed
+					break
+				}
+			}
+			// Log and ignore if unparseable
+			if modTime == nil && logf != nil {
+				logf("metadata: couldn't parse mtime %q: %v", v, pErr)
+			}
+		case "tier":
+			// ignore - handled elsewhere
+		default:
+			// Filter out other reserved headers so they don't end up as user metadata
+			if strings.HasPrefix(lowerKey, "x-ms-") {
+				continue
+			}
+			tmp[lowerKey] = v
+		}
+	}
+	userMeta = toAzureMetaPtr(tmp)
+	return headers, userMeta, tags, modTime, nil
+}
+
+// toAzureMetaPtr converts a map[string]string to map[string]*string as used by Azure SDK
+func toAzureMetaPtr(in map[string]string) map[string]*string {
+	if len(in) == 0 {
+		return nil
+	}
+	out := make(map[string]*string, len(in))
+	for k, v := range in {
+		vv := v
+		out[k] = &vv
+	}
+	return out
+}
+
+// assembleCopyParams prepares headers, metadata and tags for copy operations.
+//
+// It starts from the source properties, optionally overlays mapped metadata
+// from rclone's metadata options, ensures mtime presence when mapping is
+// enabled, and returns whether mapping was actually requested (hadMapping).
+// assembleCopyParams prepares headers, metadata and tags for copy operations.
+//
+// If includeBaseMeta is true, start user metadata from the source's metadata
+// and overlay mapped values. This matches multipart copy commit behavior.
+// If false, only include mapped user metadata (no source baseline) which
+// matches previous singlepart StartCopyFromURL semantics.
+func assembleCopyParams(ctx context.Context, f *Fs, src fs.Object, srcProps *blob.GetPropertiesResponse, includeBaseMeta bool) (headers blob.HTTPHeaders, meta map[string]*string, tags map[string]string, hadMapping bool, err error) {
+	// Start from source properties
+	headers = blob.HTTPHeaders{
+		BlobCacheControl:       srcProps.CacheControl,
+		BlobContentDisposition: srcProps.ContentDisposition,
+		BlobContentEncoding:    srcProps.ContentEncoding,
+		BlobContentLanguage:    srcProps.ContentLanguage,
+		BlobContentMD5:         srcProps.ContentMD5,
+		BlobContentType:        srcProps.ContentType,
+	}
+	// Optionally deep copy user metadata pointers from source. Normalise keys to
+	// lower-case to avoid duplicate x-ms-meta headers when we later inject/overlay
+	// metadata (Azure treats keys case-insensitively but Go's http.Header will
+	// join duplicate keys into a comma separated list, which breaks shared-key
+	// signing).
+	if includeBaseMeta && len(srcProps.Metadata) > 0 {
+		meta = make(map[string]*string, len(srcProps.Metadata))
+		for k, v := range srcProps.Metadata {
+			if v != nil {
+				vv := *v
+				meta[strings.ToLower(k)] = &vv
+			}
+		}
+	}
+
+	// Only consider mapping if metadata pipeline is enabled
+	if fs.GetConfig(ctx).Metadata {
+		mapped, mapErr := fs.GetMetadataOptions(ctx, f, src, fs.MetadataAsOpenOptions(ctx))
+		if mapErr != nil {
+			return headers, meta, nil, false, fmt.Errorf("failed to map metadata: %w", mapErr)
+		}
+		if mapped != nil {
+			// Map rclone metadata to Azure shapes
+			mappedHeaders, userMeta, mappedTags, mappedModTime, herr := mapMetadataToAzure(mapped, func(format string, args ...any) { fs.Debugf(f, format, args...) })
+			if herr != nil {
+				return headers, meta, nil, false, fmt.Errorf("metadata mapping: %w", herr)
+			}
+			hadMapping = true
+			// Overlay headers (only non-nil)
+			if mappedHeaders.BlobCacheControl != nil {
+				headers.BlobCacheControl = mappedHeaders.BlobCacheControl
+			}
+			if mappedHeaders.BlobContentDisposition != nil {
+				headers.BlobContentDisposition = mappedHeaders.BlobContentDisposition
+			}
+			if mappedHeaders.BlobContentEncoding != nil {
+				headers.BlobContentEncoding = mappedHeaders.BlobContentEncoding
+			}
+			if mappedHeaders.BlobContentLanguage != nil {
+				headers.BlobContentLanguage = mappedHeaders.BlobContentLanguage
+			}
+			if mappedHeaders.BlobContentType != nil {
+				headers.BlobContentType = mappedHeaders.BlobContentType
+			}
+			// Overlay user metadata
+			if len(userMeta) > 0 {
+				if meta == nil {
+					meta = make(map[string]*string, len(userMeta))
+				}
+				maps.Copy(meta, userMeta)
+			}
+			// Apply tags if any
+			if len(mappedTags) > 0 {
+				tags = mappedTags
+			}
+			// Ensure mtime present using mapped or source time
+			if _, ok := meta[modTimeKey]; !ok {
+				when := src.ModTime(ctx)
+				if mappedModTime != nil {
+					when = *mappedModTime
+				}
+				val := when.Format(time.RFC3339Nano)
+				if meta == nil {
+					meta = make(map[string]*string, 1)
+				}
+				meta[modTimeKey] = &val
+			}
+			// Ensure content-type fallback to source if not set by mapper
+			if headers.BlobContentType == nil {
+				headers.BlobContentType = srcProps.ContentType
+			}
+		} else {
+			// Mapping enabled but not provided: ensure mtime present based on source ModTime
+			if _, ok := meta[modTimeKey]; !ok {
+				when := src.ModTime(ctx)
+				val := when.Format(time.RFC3339Nano)
+				if meta == nil {
+					meta = make(map[string]*string, 1)
+				}
+				meta[modTimeKey] = &val
+			}
+		}
+	}
+
+	return headers, meta, tags, hadMapping, nil
+}
+
+// applyMappedMetadata applies mapped metadata and headers to the object state for uploads.
+//
+// It reads `--metadata`, `--metadata-set`, and `--metadata-mapper` outputs via fs.GetMetadataOptions
+// and updates o.meta, o.tags and ui.httpHeaders accordingly.
+func (o *Object) applyMappedMetadata(ctx context.Context, src fs.ObjectInfo, ui *uploadInfo, options []fs.OpenOption) (modTime time.Time, err error) {
+	// Start from the source modtime; may be overridden by metadata
+	modTime = src.ModTime(ctx)
+
+	// Fetch mapped metadata if --metadata is enabled
+	meta, err := fs.GetMetadataOptions(ctx, o.fs, src, options)
+	if err != nil {
+		return modTime, err
+	}
+	if meta == nil {
+		// No metadata processing requested
+		return modTime, nil
+	}
+
+	// Map metadata using common helper
+	headers, userMeta, tags, mappedModTime, err := mapMetadataToAzure(meta, func(format string, args ...any) { fs.Debugf(o, format, args...) })
+	if err != nil {
+		return modTime, err
+	}
+	// Merge headers into ui
+	if headers.BlobCacheControl != nil {
+		ui.httpHeaders.BlobCacheControl = headers.BlobCacheControl
+	}
+	if headers.BlobContentDisposition != nil {
+		ui.httpHeaders.BlobContentDisposition = headers.BlobContentDisposition
+	}
+	if headers.BlobContentEncoding != nil {
+		ui.httpHeaders.BlobContentEncoding = headers.BlobContentEncoding
+	}
+	if headers.BlobContentLanguage != nil {
+		ui.httpHeaders.BlobContentLanguage = headers.BlobContentLanguage
+	}
+	if headers.BlobContentType != nil {
+		ui.httpHeaders.BlobContentType = headers.BlobContentType
+	}
+
+	// Apply user metadata to o.meta with a single critical section
+	if len(userMeta) > 0 {
+		metadataMu.Lock()
+		if o.meta == nil {
+			o.meta = make(map[string]string, len(userMeta))
+		}
+		for k, v := range userMeta {
+			if v != nil {
+				o.meta[k] = *v
+			}
+		}
+		metadataMu.Unlock()
+	}
+
+	// Apply tags
+	if len(tags) > 0 {
+		if o.tags == nil {
+			o.tags = make(map[string]string, len(tags))
+		}
+		maps.Copy(o.tags, tags)
+	}
+
+	if mappedModTime != nil {
+		modTime = *mappedModTime
+	}
+
+	return modTime, nil
 }
 
 // Returns whether file is a directory marker or not
@@ -1213,7 +1114,7 @@ func (f *Fs) list(ctx context.Context, containerName, directory, prefix string, 
 					continue
 				}
 				// process directory markers as directories
-				remote = strings.TrimRight(remote, "/")
+				remote, _ = strings.CutSuffix(remote, "/")
 			}
 			remote = remote[len(prefix):]
 			if addContainer {
@@ -1295,9 +1196,9 @@ func (f *Fs) containerOK(container string) bool {
 }
 
 // listDir lists a single directory
-func (f *Fs) listDir(ctx context.Context, containerName, directory, prefix string, addContainer bool) (entries fs.DirEntries, err error) {
+func (f *Fs) listDir(ctx context.Context, containerName, directory, prefix string, addContainer bool, callback func(fs.DirEntry) error) (err error) {
 	if !f.containerOK(containerName) {
-		return nil, fs.ErrorDirNotFound
+		return fs.ErrorDirNotFound
 	}
 	err = f.list(ctx, containerName, directory, prefix, addContainer, false, int32(f.opt.ListChunkSize), func(remote string, object *container.BlobItem, isDirectory bool) error {
 		entry, err := f.itemToDirEntry(ctx, remote, object, isDirectory)
@@ -1305,16 +1206,16 @@ func (f *Fs) listDir(ctx context.Context, containerName, directory, prefix strin
 			return err
 		}
 		if entry != nil {
-			entries = append(entries, entry)
+			return callback(entry)
 		}
 		return nil
 	})
 	if err != nil {
-		return nil, err
+		return err
 	}
 	// container must be present if listing succeeded
 	f.cache.MarkOK(containerName)
-	return entries, nil
+	return nil
 }
 
 // listContainers returns all the containers to out
@@ -1350,14 +1251,47 @@ func (f *Fs) listContainers(ctx context.Context) (entries fs.DirEntries, err err
 // This should return ErrDirNotFound if the directory isn't
 // found.
 func (f *Fs) List(ctx context.Context, dir string) (entries fs.DirEntries, err error) {
+	return list.WithListP(ctx, dir, f)
+}
+
+// ListP lists the objects and directories of the Fs starting
+// from dir non recursively into out.
+//
+// dir should be "" to start from the root, and should not
+// have trailing slashes.
+//
+// This should return ErrDirNotFound if the directory isn't
+// found.
+//
+// It should call callback for each tranche of entries read.
+// These need not be returned in any particular order.  If
+// callback returns an error then the listing will stop
+// immediately.
+func (f *Fs) ListP(ctx context.Context, dir string, callback fs.ListRCallback) error {
+	list := list.NewHelper(callback)
 	container, directory := f.split(dir)
 	if container == "" {
 		if directory != "" {
-			return nil, fs.ErrorListBucketRequired
+			return fs.ErrorListBucketRequired
 		}
-		return f.listContainers(ctx)
+		entries, err := f.listContainers(ctx)
+		if err != nil {
+			return err
+		}
+		for _, entry := range entries {
+			err = list.Add(entry)
+			if err != nil {
+				return err
+			}
+		}
+	} else {
+		err := f.listDir(ctx, container, directory, f.rootDirectory, f.rootContainer == "", list.Add)
+		if err != nil {
+			return err
+		}
+
 	}
-	return f.listDir(ctx, container, directory, f.rootDirectory, f.rootContainer == "")
+	return list.Flush()
 }
 
 // ListR lists the objects and directories of the Fs starting
@@ -1378,7 +1312,7 @@ func (f *Fs) List(ctx context.Context, dir string) (entries fs.DirEntries, err e
 // of listing recursively that doing a directory traversal.
 func (f *Fs) ListR(ctx context.Context, dir string, callback fs.ListRCallback) (err error) {
 	containerName, directory := f.split(dir)
-	list := walk.NewListRHelper(callback)
+	list := list.NewHelper(callback)
 	listR := func(containerName, directory, prefix string, addContainer bool) error {
 		return f.list(ctx, containerName, directory, prefix, addContainer, true, int32(f.opt.ListChunkSize), func(remote string, object *container.BlobItem, isDirectory bool) error {
 			entry, err := f.itemToDirEntry(ctx, remote, object, isDirectory)
@@ -1534,7 +1468,7 @@ func (f *Fs) Mkdir(ctx context.Context, dir string) error {
 
 // mkdirParent creates the parent bucket/directory if it doesn't exist
 func (f *Fs) mkdirParent(ctx context.Context, remote string) error {
-	remote = strings.TrimRight(remote, "/")
+	remote, _ = strings.CutSuffix(remote, "/")
 	dir := path.Dir(remote)
 	if dir == "/" || dir == "." {
 		dir = ""
@@ -1684,6 +1618,38 @@ func (f *Fs) Purge(ctx context.Context, dir string) error {
 	return f.deleteContainer(ctx, container)
 }
 
+// Get a user delegation which is valid for at least sasCopyValidity
+//
+// This value is cached in f
+func (f *Fs) getUserDelegation(ctx context.Context) (*service.UserDelegationCredential, error) {
+	f.userDelegationMu.Lock()
+	defer f.userDelegationMu.Unlock()
+
+	if f.userDelegation != nil && time.Until(f.userDelegationExpiry) > sasCopyValidity {
+		return f.userDelegation, nil
+	}
+
+	// Validity window
+	start := time.Now().UTC()
+	expiry := start.Add(2 * sasCopyValidity)
+	startStr := start.Format(time.RFC3339)
+	expiryStr := expiry.Format(time.RFC3339)
+
+	// Acquire user delegation key from the service client
+	info := service.KeyInfo{
+		Start:  &startStr,
+		Expiry: &expiryStr,
+	}
+	userDelegationKey, err := f.svc.GetUserDelegationCredential(ctx, info, nil)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get user delegation key: %w", err)
+	}
+
+	f.userDelegation = userDelegationKey
+	f.userDelegationExpiry = expiry
+	return f.userDelegation, nil
+}
+
 // getAuth gets auth to copy o.
 //
 // tokenOK is used to signal that token based auth (Microsoft Entra
@@ -1695,7 +1661,7 @@ func (f *Fs) Purge(ctx context.Context, dir string) error {
 // URL (not a SAS) and token will be empty.
 //
 // If tokenOK is true it may also return a token for the auth.
-func (o *Object) getAuth(ctx context.Context, tokenOK bool, noAuth bool) (srcURL string, token *string, err error) {
+func (o *Object) getAuth(ctx context.Context, noAuth bool) (srcURL string, err error) {
 	f := o.fs
 	srcBlobSVC := o.getBlobSVC()
 	srcURL = srcBlobSVC.URL()
@@ -1704,29 +1670,47 @@ func (o *Object) getAuth(ctx context.Context, tokenOK bool, noAuth bool) (srcURL
 	case noAuth:
 		// If same storage account then no auth needed
 	case f.cred != nil:
-		if !tokenOK {
-			return srcURL, token, errors.New("not supported: Microsoft Entra ID")
-		}
-		options := policy.TokenRequestOptions{}
-		accessToken, err := f.cred.GetToken(ctx, options)
+		// Generate a User Delegation SAS URL using Azure AD credentials
+		userDelegationKey, err := f.getUserDelegation(ctx)
 		if err != nil {
-			return srcURL, token, fmt.Errorf("failed to create access token: %w", err)
+			return "", fmt.Errorf("sas creation: %w", err)
 		}
-		token = &accessToken.Token
-	case f.sharedKeyCred != nil:
+
+		// Build the SAS values
+		perms := sas.BlobPermissions{Read: true}
+		container, containerPath := o.split()
+		start := time.Now().UTC()
+		expiry := start.Add(sasCopyValidity)
+		vals := sas.BlobSignatureValues{
+			StartTime:     start,
+			ExpiryTime:    expiry,
+			Permissions:   perms.String(),
+			ContainerName: container,
+			BlobName:      containerPath,
+		}
+
+		// Sign with the delegation key
+		queryParameters, err := vals.SignWithUserDelegation(userDelegationKey)
+		if err != nil {
+			return "", fmt.Errorf("signing SAS with user delegation failed: %w", err)
+		}
+
+		// Append the SAS to the URL
+		srcURL = srcBlobSVC.URL() + "?" + queryParameters.Encode()
+	case f.usingSharedKeyCred:
 		// Generate a short lived SAS URL if using shared key credentials
-		expiry := time.Now().Add(time.Hour)
+		expiry := time.Now().Add(sasCopyValidity)
 		sasOptions := blob.GetSASURLOptions{}
 		srcURL, err = srcBlobSVC.GetSASURL(sas.BlobPermissions{Read: true}, expiry, &sasOptions)
 		if err != nil {
-			return srcURL, token, fmt.Errorf("failed to create SAS URL: %w", err)
+			return srcURL, fmt.Errorf("failed to create SAS URL: %w", err)
 		}
 	case f.anonymous || f.opt.SASURL != "":
 		// If using a SASURL or anonymous, no need for any extra auth
 	default:
-		return srcURL, token, errors.New("unknown authentication type")
+		return srcURL, errors.New("unknown authentication type")
 	}
-	return srcURL, token, nil
+	return srcURL, nil
 }
 
 // Do multipart parallel copy.
@@ -1747,7 +1731,7 @@ func (f *Fs) copyMultipart(ctx context.Context, remote, dstContainer, dstPath st
 	o.fs = f
 	o.remote = remote
 
-	srcURL, token, err := src.getAuth(ctx, true, false)
+	srcURL, err := src.getAuth(ctx, false)
 	if err != nil {
 		return nil, fmt.Errorf("multipart copy: %w", err)
 	}
@@ -1768,22 +1752,30 @@ func (f *Fs) copyMultipart(ctx context.Context, remote, dstContainer, dstPath st
 	var (
 		srcSize  = src.size
 		partSize = int64(chunksize.Calculator(o, src.size, blockblob.MaxBlocks, f.opt.ChunkSize))
-		numParts = (srcSize-1)/partSize + 1
+		numParts = (srcSize + partSize - 1) / partSize
 		blockIDs = make([]string, numParts) // list of blocks for finalize
 		g, gCtx  = errgroup.WithContext(ctx)
 		checker  = newCheckForInvalidBlockOrBlob("copy", o)
+		account  = transferaccounter.Get(ctx)
 	)
 	g.SetLimit(f.opt.CopyConcurrency)
 
 	fs.Debugf(o, "Starting  multipart copy with %d parts of size %v", numParts, fs.SizeSuffix(partSize))
+	account.Start()
 	for partNum := uint64(0); partNum < uint64(numParts); partNum++ {
 		// Fail fast, in case an errgroup managed function returns an error
 		// gCtx is cancelled. There is no point in uploading all the other parts.
 		if gCtx.Err() != nil {
 			break
 		}
+		if f.opt.CopyTotalConcurrency > 0 {
+			f.copyToken.Get()
+		}
 		partNum := partNum // for closure
 		g.Go(func() error {
+			if f.opt.CopyTotalConcurrency > 0 {
+				defer f.copyToken.Put()
+			}
 			blockID := bic.newBlockID(partNum)
 			options := blockblob.StageBlockFromURLOptions{
 				Range: blob.HTTPRange{
@@ -1791,7 +1783,8 @@ func (f *Fs) copyMultipart(ctx context.Context, remote, dstContainer, dstPath st
 					Count:  partSize,
 				},
 				// Specifies the authorization scheme and signature for the copy source.
-				CopySourceAuthorization: token,
+				// We use SAS URLs as this doesn't seem to work always
+				// CopySourceAuthorization: token,
 				// CPKInfo *blob.CPKInfo
 				// CPKScopeInfo *blob.CPKScopeInfo
 			}
@@ -1816,6 +1809,7 @@ func (f *Fs) copyMultipart(ctx context.Context, remote, dstContainer, dstPath st
 				return fmt.Errorf("multipart copy: failed to copy chunk %d with %v bytes: %w", partNum+1, -1, err)
 			}
 			blockIDs[partNum] = blockID
+			account.Add(options.Range.Count)
 			return nil
 		})
 	}
@@ -1824,18 +1818,19 @@ func (f *Fs) copyMultipart(ctx context.Context, remote, dstContainer, dstPath st
 		return nil, err
 	}
 
-	// Convert metadata from source object
+	// Prepare metadata/headers/tags for destination
+	// For multipart commit, include base metadata from source then overlay mapped
+	commitHeaders, commitMeta, commitTags, _, err := assembleCopyParams(ctx, f, src, srcProperties, true)
+	if err != nil {
+		return nil, fmt.Errorf("multipart copy: %w", err)
+	}
+
+	// Convert metadata from source or mapper
 	options := blockblob.CommitBlockListOptions{
-		Metadata: srcProperties.Metadata,
-		Tier:     parseTier(f.opt.AccessTier),
-		HTTPHeaders: &blob.HTTPHeaders{
-			BlobCacheControl:       srcProperties.CacheControl,
-			BlobContentDisposition: srcProperties.ContentDisposition,
-			BlobContentEncoding:    srcProperties.ContentEncoding,
-			BlobContentLanguage:    srcProperties.ContentLanguage,
-			BlobContentMD5:         srcProperties.ContentMD5,
-			BlobContentType:        srcProperties.ContentType,
-		},
+		Metadata:    commitMeta,
+		Tags:        commitTags,
+		Tier:        parseTier(f.opt.AccessTier),
+		HTTPHeaders: &commitHeaders,
 	}
 
 	// Finalise the upload session
@@ -1861,14 +1856,38 @@ func (f *Fs) copySinglepart(ctx context.Context, remote, dstContainer, dstPath s
 	dstBlobSVC := f.getBlobSVC(dstContainer, dstPath)
 
 	// Get the source auth - none needed for same storage account
-	srcURL, _, err := src.getAuth(ctx, false, f == src.fs)
+	srcURL, err := src.getAuth(ctx, f == src.fs)
 	if err != nil {
 		return nil, fmt.Errorf("single part copy: source auth: %w", err)
 	}
 
-	// Start the copy
+	// Prepare mapped metadata/tags/headers if requested
 	options := blob.StartCopyFromURLOptions{
 		Tier: parseTier(f.opt.AccessTier),
+	}
+	var postHeaders *blob.HTTPHeaders
+	// Read source properties and assemble params; this also handles the case when mapping is disabled
+	srcProps, err := src.readMetaDataAlways(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("single part copy: read source properties: %w", err)
+	}
+	// For singlepart copy, do not include base metadata from source in StartCopyFromURL
+	headers, meta, tags, hadMapping, aerr := assembleCopyParams(ctx, f, src, srcProps, false)
+	if aerr != nil {
+		return nil, fmt.Errorf("single part copy: %w", aerr)
+	}
+	// Apply tags and post-copy headers only when mapping requested changes
+	if len(tags) > 0 {
+		options.BlobTags = make(map[string]string, len(tags))
+		maps.Copy(options.BlobTags, tags)
+	}
+	if hadMapping {
+		// Only set metadata explicitly when mapping was requested; otherwise
+		// let the service copy source metadata (including mtime) automatically.
+		if len(meta) > 0 {
+			options.Metadata = meta
+		}
+		postHeaders = &headers
 	}
 	var startCopy blob.StartCopyFromURLResponse
 	err = f.pacer.Call(func() (bool, error) {
@@ -1898,6 +1917,16 @@ func (f *Fs) copySinglepart(ctx context.Context, remote, dstContainer, dstPath s
 		copyStatus = getMetadata.CopyStatus
 		pollTime = min(2*pollTime, time.Second)
 	}
+
+	// If mapper requested header changes, set them post-copy
+	if postHeaders != nil {
+		blb := f.getBlobSVC(dstContainer, dstPath)
+		_, setErr := blb.SetHTTPHeaders(ctx, *postHeaders, nil)
+		if setErr != nil {
+			return nil, fmt.Errorf("single part copy: failed to set headers: %w", setErr)
+		}
+	}
+	// Metadata (when requested) is set via StartCopyFromURL options.Metadata
 
 	return f.NewObject(ctx, remote)
 }
@@ -2025,10 +2054,36 @@ func (o *Object) getMetadata() (metadata map[string]*string) {
 	}
 	metadata = make(map[string]*string, len(o.meta))
 	for k, v := range o.meta {
-		v := v
 		metadata[k] = &v
 	}
 	return metadata
+}
+
+// Metadata returns metadata for an object
+//
+// It returns a combined view of system and user metadata.
+func (o *Object) Metadata(ctx context.Context) (fs.Metadata, error) {
+	// Ensure metadata is loaded
+	if err := o.readMetaData(ctx); err != nil {
+		return nil, err
+	}
+
+	m := fs.Metadata{}
+
+	// System metadata we expose
+	if !o.modTime.IsZero() {
+		m["mtime"] = o.modTime.Format(time.RFC3339Nano)
+	}
+	if o.accessTier != "" {
+		m["tier"] = string(o.accessTier)
+	}
+
+	// Merge user metadata (already lower-cased keys)
+	metadataMu.Lock()
+	maps.Copy(m, o.meta)
+	metadataMu.Unlock()
+
+	return m, nil
 }
 
 // decodeMetaDataFromPropertiesResponse sets the metadata from the data passed in
@@ -2176,11 +2231,6 @@ func (o *Object) getTags() (tags map[string]string) {
 // getBlobSVC creates a blob client
 func (o *Object) getBlobSVC() *blob.Client {
 	container, directory := o.split()
-	// If we are trying to remove an all / directory marker then
-	// this will have one / too many now.
-	if bucket.IsAllSlashes(o.remote) {
-		directory = strings.TrimSuffix(directory, "/")
-	}
 	return o.fs.getBlobSVC(container, directory)
 }
 
@@ -2582,6 +2632,13 @@ func (w *azChunkWriter) WriteChunk(ctx context.Context, chunkNumber int, reader 
 		return -1, err
 	}
 
+	// Only account after the checksum reads have been done
+	if do, ok := reader.(pool.DelayAccountinger); ok {
+		// To figure out this number, do a transfer and if the accounted size is 0 or a
+		// multiple of what it should be, increase or decrease this number.
+		do.DelayAccounting(2)
+	}
+
 	// Upload the block, with MD5 for check
 	m := md5.New()
 	currentChunkSize, err := io.Copy(m, reader)
@@ -2863,17 +2920,22 @@ func (o *Object) prepareUpload(ctx context.Context, src fs.ObjectInfo, options [
 			return ui, err
 		}
 	}
+	// if ui.isDirMarker && strings.HasSuffix(containerPath, "//") {
+	// 	containerPath = containerPath[:len(containerPath)-1]
+	// }
 
-	// Update Mod time
-	o.updateMetadataWithModTime(src.ModTime(ctx))
-	if err != nil {
-		return ui, err
-	}
-
-	// Create the HTTP headers for the upload
+	// Start with default content-type based on source
 	ui.httpHeaders = blob.HTTPHeaders{
 		BlobContentType: pString(fs.MimeType(ctx, src)),
 	}
+
+	// Apply mapped metadata/headers/tags if requested
+	modTime, err := o.applyMappedMetadata(ctx, src, &ui, options)
+	if err != nil {
+		return ui, err
+	}
+	// Ensure mtime is set in metadata based on possibly overridden modTime
+	o.updateMetadataWithModTime(modTime)
 
 	// Compute the Content-MD5 of the file. As we stream all uploads it
 	// will be set in PutBlockList API call using the 'x-ms-blob-content-md5' header
@@ -3055,6 +3117,7 @@ var (
 	_ fs.PutStreamer     = &Fs{}
 	_ fs.Purger          = &Fs{}
 	_ fs.ListRer         = &Fs{}
+	_ fs.ListPer         = &Fs{}
 	_ fs.OpenChunkWriter = &Fs{}
 	_ fs.Object          = &Object{}
 	_ fs.MimeTyper       = &Object{}

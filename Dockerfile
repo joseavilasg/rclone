@@ -1,6 +1,6 @@
 FROM alpine:latest
 
-RUN apk --no-cache add ca-certificates fuse3 tzdata unzip && \
+RUN apk --no-cache add ca-certificates fuse3 tzdata unzip coreutils && \
     echo "user_allow_other" >> /etc/fuse.conf
 
 ARG TARGETARCH
@@ -17,7 +17,7 @@ RUN unzip /tmp/rclone.zip -d /tmp && \
     rm -rf /tmp/rclone* && \
     apk del unzip
 
-RUN addgroup -g 1009 rclone && adduser -u 1009 -Ds /bin/sh -G rclone rclone
+RUN addgroup -g 1000 rclone && adduser -u 1000 -Ds /bin/sh -G rclone rclone
 
 ENTRYPOINT [ "rclone" ]
 

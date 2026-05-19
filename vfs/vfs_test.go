@@ -11,7 +11,6 @@ import (
 	"testing"
 	"time"
 
-	_ "github.com/rclone/rclone/backend/all" // import all the backends
 	"github.com/rclone/rclone/fs"
 	"github.com/rclone/rclone/fstest"
 	"github.com/rclone/rclone/vfs/vfscommon"
@@ -486,4 +485,18 @@ func TestFillInMissingSizes(t *testing.T) {
 			assert.Equal(t, test.wantFree, gotFree, "free")
 		})
 	}
+}
+
+func TestVFSIsMetadataFile(t *testing.T) {
+	_, vfs := newTestVFS(t)
+
+	rawName, found := vfs.isMetadataFile("leaf.metadata")
+	assert.Equal(t, "leaf.metadata", rawName)
+	assert.Equal(t, false, found)
+
+	vfs.Opt.MetadataExtension = ".metadata"
+
+	rawName, found = vfs.isMetadataFile("leaf.metadata")
+	assert.Equal(t, "leaf", rawName)
+	assert.Equal(t, true, found)
 }

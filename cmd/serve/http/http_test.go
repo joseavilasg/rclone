@@ -1,9 +1,11 @@
 package http
 
 import (
+	"compress/gzip"
 	"context"
 	"flag"
 	"io"
+	stdfs "io/fs"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -12,10 +14,13 @@ import (
 	"time"
 
 	_ "github.com/rclone/rclone/backend/local"
-	"github.com/rclone/rclone/cmd/serve/proxy/proxyflags"
+	"github.com/rclone/rclone/cmd/serve/proxy"
+	"github.com/rclone/rclone/cmd/serve/servetest"
 	"github.com/rclone/rclone/fs"
 	"github.com/rclone/rclone/fs/filter"
+	"github.com/rclone/rclone/fs/rc"
 	libhttp "github.com/rclone/rclone/lib/http"
+	"github.com/rclone/rclone/vfs/vfscommon"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -39,13 +44,16 @@ func start(ctx context.Context, t *testing.T, f fs.Fs) (s *HTTP, testURL string)
 		},
 	}
 	opts.HTTP.ListenAddr = []string{testBindAddress}
-	if proxyflags.Opt.AuthProxy == "" {
+	if proxy.Opt.AuthProxy == "" {
 		opts.Auth.BasicUser = testUser
 		opts.Auth.BasicPass = testPass
 	}
 
-	s, err := run(ctx, f, opts)
+	s, err := newServer(ctx, f, &opts, &vfscommon.Opt, &proxy.Opt)
 	require.NoError(t, err, "failed to start server")
+	go func() {
+		require.NoError(t, s.Serve())
+	}()
 
 	urls := s.server.URLs()
 	require.Len(t, urls, 1, "expected one URL")
@@ -67,6 +75,16 @@ func start(ctx context.Context, t *testing.T, f fs.Fs) (s *HTTP, testURL string)
 	t.Fatal("couldn't connect to server")
 
 	return s, testURL
+}
+
+// setAllModTimes walks root and sets atime/mtime to t for every file & directory.
+func setAllModTimes(root string, t time.Time) error {
+	return filepath.WalkDir(root, func(path string, d stdfs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		return os.Chtimes(path, t, t)
+	})
 }
 
 var (
@@ -110,13 +128,15 @@ func testGET(t *testing.T, useProxy bool) {
 		cmd := "go run " + prog + " " + files
 
 		// FIXME this is untidy setting a global variable!
-		proxyflags.Opt.AuthProxy = cmd
+		proxy.Opt.AuthProxy = cmd
 		defer func() {
-			proxyflags.Opt.AuthProxy = ""
+			proxy.Opt.AuthProxy = ""
 		}()
 
 		f = nil
 	} else {
+		// set all the mod times to expectedTime
+		require.NoError(t, setAllModTimes("testdata/files", expectedTime))
 		// Create a test Fs
 		var err error
 		f, err = fs.NewFs(context.Background(), "testdata/files")
@@ -227,6 +247,16 @@ func testGET(t *testing.T, useProxy bool) {
 			Range:  "bytes=3-",
 			Golden: "testdata/golden/two3-.txt",
 		},
+		{
+			URL:    "/?download=zip",
+			Status: http.StatusOK,
+			Golden: "testdata/golden/root.zip",
+		},
+		{
+			URL:    "/three/?download=zip",
+			Status: http.StatusOK,
+			Golden: "testdata/golden/three.zip",
+		},
 	} {
 		method := test.Method
 		if method == "" {
@@ -266,4 +296,121 @@ func TestGET(t *testing.T) {
 
 func TestAuthProxy(t *testing.T) {
 	testGET(t, true)
+}
+
+func TestFavicon(t *testing.T) {
+	ctx := context.Background()
+
+	doGet := func(testURL, path string) *http.Response {
+		req, err := http.NewRequest("GET", testURL+path, nil)
+		require.NoError(t, err)
+		req.SetBasicAuth(testUser, testPass)
+		resp, err := http.DefaultClient.Do(req)
+		require.NoError(t, err)
+		return resp
+	}
+
+	t.Run("fallback", func(t *testing.T) {
+		// testdata/files has no favicon.ico, so the embedded fallback is served
+		f, err := fs.NewFs(ctx, "testdata/files")
+		require.NoError(t, err)
+		s, testURL := start(ctx, t, f)
+		defer func() { assert.NoError(t, s.server.Shutdown()) }()
+
+		resp := doGet(testURL, "favicon.ico")
+		defer func() { _ = resp.Body.Close() }()
+		assert.Equal(t, http.StatusOK, resp.StatusCode)
+		assert.Equal(t, "image/png", resp.Header.Get("Content-Type"))
+		assert.Equal(t, "max-age=86400", resp.Header.Get("Cache-Control"))
+		body, err := io.ReadAll(resp.Body)
+		require.NoError(t, err)
+		assert.Equal(t, faviconData, body)
+	})
+
+	t.Run("remote override", func(t *testing.T) {
+		// Start a server on a temp dir that already contains a custom favicon.ico,
+		// so the VFS sees it at init time and serves it instead of the fallback.
+		dir := t.TempDir()
+		customFavicon := []byte("custom favicon data")
+		require.NoError(t, os.WriteFile(filepath.Join(dir, "favicon.ico"), customFavicon, 0666))
+
+		f, err := fs.NewFs(ctx, dir)
+		require.NoError(t, err)
+		s, testURL := start(ctx, t, f)
+		defer func() { assert.NoError(t, s.server.Shutdown()) }()
+
+		resp := doGet(testURL, "favicon.ico")
+		defer func() { _ = resp.Body.Close() }()
+		assert.Equal(t, http.StatusOK, resp.StatusCode)
+		body, err := io.ReadAll(resp.Body)
+		require.NoError(t, err)
+		assert.Equal(t, customFavicon, body)
+	})
+}
+
+func TestCompressedDirectoryListing(t *testing.T) {
+	ctx := context.Background()
+	require.NoError(t, setAllModTimes("testdata/files", expectedTime))
+	f, err := fs.NewFs(ctx, "testdata/files")
+	require.NoError(t, err)
+
+	s, testURL := start(ctx, t, f)
+	defer func() { assert.NoError(t, s.server.Shutdown()) }()
+
+	req, err := http.NewRequest("GET", testURL, nil)
+	require.NoError(t, err)
+	req.SetBasicAuth(testUser, testPass)
+	req.Header.Set("Accept-Encoding", "gzip")
+
+	resp, err := http.DefaultClient.Do(req)
+	require.NoError(t, err)
+	defer func() { _ = resp.Body.Close() }()
+
+	assert.Equal(t, http.StatusOK, resp.StatusCode)
+	assert.Equal(t, "gzip", resp.Header.Get("Content-Encoding"))
+
+	gr, err := gzip.NewReader(resp.Body)
+	require.NoError(t, err)
+	defer func() { _ = gr.Close() }()
+
+	body, err := io.ReadAll(gr)
+	require.NoError(t, err)
+	assert.Contains(t, string(body), "Directory listing of /")
+}
+
+func TestCompressedTextFile(t *testing.T) {
+	ctx := context.Background()
+	require.NoError(t, setAllModTimes("testdata/files", expectedTime))
+	f, err := fs.NewFs(ctx, "testdata/files")
+	require.NoError(t, err)
+
+	s, testURL := start(ctx, t, f)
+	defer func() { assert.NoError(t, s.server.Shutdown()) }()
+
+	req, err := http.NewRequest("GET", testURL+"two.txt", nil)
+	require.NoError(t, err)
+	req.SetBasicAuth(testUser, testPass)
+	req.Header.Set("Accept-Encoding", "gzip")
+
+	resp, err := http.DefaultClient.Do(req)
+	require.NoError(t, err)
+	defer func() { _ = resp.Body.Close() }()
+
+	assert.Equal(t, http.StatusOK, resp.StatusCode)
+	assert.Equal(t, "gzip", resp.Header.Get("Content-Encoding"))
+
+	gr, err := gzip.NewReader(resp.Body)
+	require.NoError(t, err)
+	defer func() { _ = gr.Close() }()
+
+	body, err := io.ReadAll(gr)
+	require.NoError(t, err)
+	assert.Equal(t, "0123456789\n", string(body))
+}
+
+func TestRc(t *testing.T) {
+	servetest.TestRc(t, rc.Params{
+		"type":           "http",
+		"vfs_cache_mode": "off",
+	})
 }

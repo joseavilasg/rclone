@@ -39,6 +39,7 @@ import (
 	"github.com/rclone/rclone/lib/pacer"
 	"github.com/rclone/rclone/lib/random"
 	"github.com/rclone/rclone/lib/readers"
+	"github.com/rclone/rclone/lib/transform"
 	"golang.org/x/sync/errgroup"
 	"golang.org/x/text/unicode/norm"
 )
@@ -114,10 +115,10 @@ func checkHashes(ctx context.Context, src fs.ObjectInfo, dst fs.Object, ht hash.
 	if srcHash != dstHash {
 		fs.Debugf(src, "%v = %s (%v)", ht, srcHash, src.Fs())
 		fs.Debugf(dst, "%v = %s (%v)", ht, dstHash, dst.Fs())
-	} else {
-		fs.Debugf(src, "%v = %s OK", ht, srcHash)
+		return false, ht, srcHash, dstHash, nil
 	}
-	return srcHash == dstHash, ht, srcHash, dstHash, nil
+	fs.Debugf(src, "%v = %s OK", ht, srcHash)
+	return true, ht, srcHash, dstHash, nil
 }
 
 // Equal checks to see if the src and dst objects are equal by looking at
@@ -183,7 +184,13 @@ func sizeDiffers(ctx context.Context, src, dst fs.ObjectInfo) bool {
 	if ci.IgnoreSize || src.Size() < 0 || dst.Size() < 0 {
 		return false
 	}
-	return src.Size() != dst.Size()
+	if src.Size() == dst.Size() {
+		fs.Debugf(dst, "size = %d OK", dst.Size())
+		return false
+	}
+	fs.Debugf(src, "size = %d (%v)", src.Size(), src.Fs())
+	fs.Debugf(dst, "size = %d (%v)", dst.Size(), dst.Fs())
+	return true
 }
 
 var checksumWarning sync.Once
@@ -240,7 +247,7 @@ func equal(ctx context.Context, src fs.ObjectInfo, dst fs.Object, opt equalOpt) 
 	ci := fs.GetConfig(ctx)
 	logger, _ := GetLogger(ctx)
 	if sizeDiffers(ctx, src, dst) {
-		fs.Debugf(src, "Sizes differ (src %d vs dst %d)", src.Size(), dst.Size())
+		fs.Debug(src, "Sizes differ")
 		logger(ctx, Differ, src, dst, nil)
 		return false
 	}
@@ -424,7 +431,13 @@ func MoveTransfer(ctx context.Context, fdst fs.Fs, dst fs.Object, remote string,
 
 // move - see Move for help
 func move(ctx context.Context, fdst fs.Fs, dst fs.Object, remote string, src fs.Object, isTransfer bool) (newDst fs.Object, err error) {
+	origRemote := remote // avoid double-transform on fallback to copy
+	remote = transform.Path(ctx, remote, false)
 	ci := fs.GetConfig(ctx)
+	newDst = dst
+	if ci.DryRun && dst != nil && SameObject(src, dst) && src.Remote() == transform.Path(ctx, dst.Remote(), false) {
+		return // avoid SkipDestructive log for objects that won't really be moved
+	}
 	var tr *accounting.Transfer
 	if isTransfer {
 		tr = accounting.Stats(ctx).NewTransfer(src, fdst)
@@ -437,8 +450,11 @@ func move(ctx context.Context, fdst fs.Fs, dst fs.Object, remote string, src fs.
 		}
 		tr.Done(ctx, err)
 	}()
-	newDst = dst
-	if SkipDestructive(ctx, src, "move") {
+	action := "move"
+	if remote != src.Remote() {
+		action += " to " + remote
+	}
+	if SkipDestructive(ctx, src, action) {
 		in := tr.Account(ctx, nil)
 		in.DryRun(src.Size())
 		return newDst, nil
@@ -447,12 +463,14 @@ func move(ctx context.Context, fdst fs.Fs, dst fs.Object, remote string, src fs.
 	if doMove := fdst.Features().Move; doMove != nil && (SameConfig(src.Fs(), fdst) || (SameRemoteType(src.Fs(), fdst) && (fdst.Features().ServerSideAcrossConfigs || ci.ServerSideAcrossConfigs))) {
 		// Delete destination if it exists and is not the same file as src (could be same file while seemingly different if the remote is case insensitive)
 		if dst != nil {
-			remote = dst.Remote()
+			remote = transform.Path(ctx, dst.Remote(), false)
 			if !SameObject(src, dst) {
 				err = DeleteFile(ctx, dst)
 				if err != nil {
 					return newDst, err
 				}
+			} else if src.Remote() == remote {
+				return newDst, nil
 			} else if needsMoveCaseInsensitive(fdst, fdst, remote, src.Remote(), false) {
 				doMove = func(ctx context.Context, src fs.Object, remote string) (fs.Object, error) {
 					return MoveCaseInsensitive(ctx, fdst, fdst, remote, src.Remote(), false, src)
@@ -488,7 +506,10 @@ func move(ctx context.Context, fdst fs.Fs, dst fs.Object, remote string, src fs.
 		}
 	}
 	// Move not found or didn't work so copy dst <- src
-	newDst, err = Copy(ctx, fdst, dst, remote, src)
+	if origRemote != remote {
+		dst = nil
+	}
+	newDst, err = Copy(ctx, fdst, dst, origRemote, src)
 	if err != nil {
 		fs.Errorf(src, "Not deleting source as copy failed: %v", err)
 		return newDst, err
@@ -516,24 +537,7 @@ func SuffixName(ctx context.Context, remote string) string {
 		return remote
 	}
 	if ci.SuffixKeepExtension {
-		var (
-			base  = remote
-			exts  = ""
-			first = true
-			ext   = path.Ext(remote)
-		)
-		for ext != "" {
-			// Look second and subsequent extensions in mime types.
-			// If they aren't found then don't keep it as an extension.
-			if !first && mime.TypeByExtension(ext) == "" {
-				break
-			}
-			base = base[:len(base)-len(ext)]
-			exts = ext + exts
-			first = false
-			ext = path.Ext(base)
-		}
-		return base + ci.Suffix + exts
+		return transform.SuffixKeepExtension(remote, ci.Suffix)
 	}
 	return remote + ci.Suffix
 }
@@ -1817,8 +1821,12 @@ func RcatSize(ctx context.Context, fdst fs.Fs, dstFileName string, in io.ReadClo
 			return nil, err
 		}
 
+		var options []fs.OpenOption
+		for _, option := range fs.GetConfig(ctx).UploadHeaders {
+			options = append(options, option)
+		}
 		info := object.NewStaticObjectInfo(dstFileName, modTime, size, true, nil, fdst).WithMetadata(meta)
-		obj, err = fdst.Put(ctx, in, info)
+		obj, err = fdst.Put(ctx, in, info, options...)
 		if err != nil {
 			fs.Errorf(dstFileName, "Post request put error: %v", err)
 
@@ -1843,7 +1851,14 @@ type copyURLFunc func(ctx context.Context, dstFileName string, in io.ReadCloser,
 // copyURLFn copies the data from the url to the function supplied
 func copyURLFn(ctx context.Context, dstFileName string, url string, autoFilename, dstFileNameFromHeader bool, fn copyURLFunc) (err error) {
 	client := fshttp.NewClient(ctx)
-	resp, err := client.Get(url)
+	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
+	if err != nil {
+		return err
+	}
+	for _, option := range fs.GetConfig(ctx).DownloadHeaders {
+		req.Header.Set(option.Key, option.Value)
+	}
+	resp, err := client.Do(req)
 	if err != nil {
 		return err
 	}
@@ -1875,8 +1890,50 @@ func copyURLFn(ctx context.Context, dstFileName string, url string, autoFilename
 	return fn(ctx, dstFileName, resp.Body, resp.ContentLength, modTime)
 }
 
+func CopyURLMulti(ctx context.Context, fdst fs.Fs, dstFileName string, srcObj fs.Object, overwrite bool) (dst fs.Object, err error) {
+	ci := fs.GetConfig(ctx)
+
+	destObj, err := fdst.NewObject(ctx, dstFileName)
+
+	if err != nil && !errors.Is(err, fs.ErrorObjectNotFound) {
+		return nil, err
+	}
+
+	needsCopy := overwrite || errors.Is(err, fs.ErrorObjectNotFound) || (destObj != nil && NeedTransfer(ctx, destObj, srcObj))
+
+	if needsCopy {
+		tr := accounting.Stats(ctx).NewTransferRemoteSize(dstFileName, srcObj.Size(), nil, fdst)
+		defer func() {
+			tr.Done(ctx, err)
+		}()
+		return multiThreadCopy(ctx, fdst, dstFileName, srcObj, ci.MultiThreadStreams, tr)
+	}
+	return destObj, nil
+}
+
 // CopyURL copies the data from the url to (fdst, dstFileName)
 func CopyURL(ctx context.Context, fdst fs.Fs, dstFileName string, url string, autoFilename, dstFileNameFromHeader bool, noClobber bool) (dst fs.Object, err error) {
+	ci := fs.GetConfig(ctx)
+	if ci.MultiThreadStreams > 0 {
+		filename := dstFileName
+		srcObj, err := object.NewHTTPObject(ctx, url, dstFileNameFromHeader)
+		if err != nil {
+			return nil, err
+		}
+		if autoFilename {
+			filename = srcObj.Remote()
+			if filename == "." || filename == "/" {
+				return nil, fmt.Errorf("CopyURL failed: file name wasn't found in url")
+			}
+		}
+		if noClobber {
+			_, err = fdst.NewObject(ctx, filename)
+			if err == nil {
+				return nil, errors.New("CopyURL failed: file already exist")
+			}
+		}
+		return CopyURLMulti(ctx, fdst, filename, srcObj, false)
+	}
 	err = copyURLFn(ctx, dstFileName, url, autoFilename, dstFileNameFromHeader, func(ctx context.Context, dstFileName string, in io.ReadCloser, size int64, modTime time.Time) (err error) {
 		if noClobber {
 			_, err = fdst.NewObject(ctx, dstFileName)
@@ -1948,6 +2005,9 @@ func MoveBackupDir(ctx context.Context, backupDir fs.Fs, dst fs.Object) (err err
 func needsMoveCaseInsensitive(fdst fs.Fs, fsrc fs.Fs, dstFileName string, srcFileName string, cp bool) bool {
 	dstFilePath := path.Join(fdst.Root(), dstFileName)
 	srcFilePath := path.Join(fsrc.Root(), srcFileName)
+	if !cp && fdst.Name() == fsrc.Name() && dstFileName != srcFileName && norm.NFC.String(dstFilePath) == norm.NFC.String(srcFilePath) {
+		return true
+	}
 	return !cp && fdst.Name() == fsrc.Name() && fdst.Features().CaseInsensitive && dstFileName != srcFileName && strings.EqualFold(dstFilePath, srcFilePath)
 }
 
@@ -1994,12 +2054,12 @@ func MoveCaseInsensitive(ctx context.Context, fdst fs.Fs, fsrc fs.Fs, dstFileNam
 }
 
 // moveOrCopyFile moves or copies a single file possibly to a new name
-func moveOrCopyFile(ctx context.Context, fdst fs.Fs, fsrc fs.Fs, dstFileName string, srcFileName string, cp bool) (err error) {
+func moveOrCopyFile(ctx context.Context, fdst fs.Fs, fsrc fs.Fs, dstFileName string, srcFileName string, cp bool, allowOverlap bool) (err error) {
 	ci := fs.GetConfig(ctx)
 	logger, usingLogger := GetLogger(ctx)
 	dstFilePath := path.Join(fdst.Root(), dstFileName)
 	srcFilePath := path.Join(fsrc.Root(), srcFileName)
-	if fdst.Name() == fsrc.Name() && dstFilePath == srcFilePath {
+	if fdst.Name() == fsrc.Name() && dstFilePath == srcFilePath && !allowOverlap {
 		fs.Debugf(fdst, "don't need to copy/move %s, it is already at target location", dstFileName)
 		if usingLogger {
 			srcObj, _ := fsrc.NewObject(ctx, srcFileName)
@@ -2106,7 +2166,14 @@ func moveOrCopyFile(ctx context.Context, fdst fs.Fs, fsrc fs.Fs, dstFileName str
 //
 // This is treated as a transfer.
 func MoveFile(ctx context.Context, fdst fs.Fs, fsrc fs.Fs, dstFileName string, srcFileName string) (err error) {
-	return moveOrCopyFile(ctx, fdst, fsrc, dstFileName, srcFileName, false)
+	return moveOrCopyFile(ctx, fdst, fsrc, dstFileName, srcFileName, false, false)
+}
+
+// TransformFile transforms a file in place using --name-transform
+//
+// This is treated as a transfer.
+func TransformFile(ctx context.Context, fdst fs.Fs, srcFileName string) (err error) {
+	return moveOrCopyFile(ctx, fdst, fdst, srcFileName, srcFileName, false, true)
 }
 
 // SetTier changes tier of object in remote
@@ -2213,52 +2280,23 @@ func (l *ListFormat) SetOutput(output []func(entry *ListJSONItem) string) {
 func (l *ListFormat) AddModTime(timeFormat string) {
 	switch timeFormat {
 	case "":
-		timeFormat = "2006-01-02 15:04:05"
-	case "Layout":
-		timeFormat = time.Layout
-	case "ANSIC":
-		timeFormat = time.ANSIC
-	case "UnixDate":
-		timeFormat = time.UnixDate
-	case "RubyDate":
-		timeFormat = time.RubyDate
-	case "RFC822":
-		timeFormat = time.RFC822
-	case "RFC822Z":
-		timeFormat = time.RFC822Z
-	case "RFC850":
-		timeFormat = time.RFC850
-	case "RFC1123":
-		timeFormat = time.RFC1123
-	case "RFC1123Z":
-		timeFormat = time.RFC1123Z
-	case "RFC3339":
-		timeFormat = time.RFC3339
-	case "RFC3339Nano":
-		timeFormat = time.RFC3339Nano
-	case "Kitchen":
-		timeFormat = time.Kitchen
-	case "Stamp":
-		timeFormat = time.Stamp
-	case "StampMilli":
-		timeFormat = time.StampMilli
-	case "StampMicro":
-		timeFormat = time.StampMicro
-	case "StampNano":
-		timeFormat = time.StampNano
-	case "DateTime":
-		// timeFormat = time.DateTime // missing in go1.19
-		timeFormat = "2006-01-02 15:04:05"
-	case "DateOnly":
-		// timeFormat = time.DateOnly // missing in go1.19
-		timeFormat = "2006-01-02"
-	case "TimeOnly":
-		// timeFormat = time.TimeOnly // missing in go1.19
-		timeFormat = "15:04:05"
+		l.AppendOutput(func(entry *ListJSONItem) string {
+			return entry.ModTime.When.Local().Format("2006-01-02 15:04:05")
+		})
+	case "unix":
+		l.AppendOutput(func(entry *ListJSONItem) string {
+			return fmt.Sprint(entry.ModTime.When.Unix())
+		})
+	case "unixnano":
+		l.AppendOutput(func(entry *ListJSONItem) string {
+			return fmt.Sprint(entry.ModTime.When.UnixNano())
+		})
+	default:
+		timeFormat = transform.TimeFormat(timeFormat)
+		l.AppendOutput(func(entry *ListJSONItem) string {
+			return entry.ModTime.When.Local().Format(timeFormat)
+		})
 	}
-	l.AppendOutput(func(entry *ListJSONItem) string {
-		return entry.ModTime.When.Local().Format(timeFormat)
-	})
 }
 
 // AddSize adds file's size to output

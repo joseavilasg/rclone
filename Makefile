@@ -113,21 +113,21 @@ release_dep_linux:
 # Update dependencies
 showupdates:
 	@echo "*** Direct dependencies that could be updated ***"
-	@GO111MODULE=on go list -u -f '{{if (and (not (or .Main .Indirect)) .Update)}}{{.Path}}: {{.Version}} -> {{.Update.Version}}{{end}}' -m all 2> /dev/null
+	@go list -u -f '{{if (and (not (or .Main .Indirect)) .Update)}}{{.Path}}: {{.Version}} -> {{.Update.Version}}{{end}}' -m all 2> /dev/null
 
 # Update direct dependencies only
 updatedirect:
-	GO111MODULE=on go get -d $$(go list -m -f '{{if not (or .Main .Indirect)}}{{.Path}}{{end}}' all)
-	GO111MODULE=on go mod tidy
+	go get $$(go list -m -f '{{if not (or .Main .Indirect)}}{{.Path}}{{end}}' all)
+	go mod tidy
 
 # Update direct and indirect dependencies and test dependencies
 update:
-	GO111MODULE=on go get -d -u -t ./...
-	GO111MODULE=on go mod tidy
+	go get -u -t ./...
+	go mod tidy
 
 # Tidy the module dependencies
 tidy:
-	GO111MODULE=on go mod tidy
+	go mod tidy
 
 doc:	rclone.1 MANUAL.html MANUAL.txt rcdocs commanddocs
 
@@ -212,6 +212,12 @@ beta:
 	go run bin/cross-compile.go $(BUILD_FLAGS) $(BUILDTAGS) $(BUILD_ARGS) $(TAG)
 	rclone -v copy build/ memstore:pub-rclone-org/$(TAG)
 	@echo Beta release ready at https://pub.rclone.org/$(TAG)/
+
+privatebeta:
+	go run bin/cross-compile.go $(BUILD_FLAGS) $(BUILDTAGS) $(BUILD_ARGS) -include '^(darwin|windows|linux)/(arm64|amd64)$$' $(TAG)
+	rclone -Pv copy build/ private-downloads:/beta/$(TAG)
+	@echo Private beta release ready at private-downloads:/beta/$(TAG)/
+	rclone link private-downloads:/beta/$(TAG)
 
 log_since_last_release:
 	git log $(LAST_TAG)..

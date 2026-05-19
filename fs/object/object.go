@@ -5,11 +5,21 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"io"
+	"mime"
+	"net/http"
+	"net/textproto"
+	"path"
+	"strings"
 	"time"
 
 	"github.com/rclone/rclone/fs"
+	"github.com/rclone/rclone/fs/fserrors"
+	"github.com/rclone/rclone/fs/fshttp"
 	"github.com/rclone/rclone/fs/hash"
+	"github.com/rclone/rclone/lib/pacer"
+	"github.com/rclone/rclone/lib/rest"
 )
 
 // StaticObjectInfo is an ObjectInfo which can be constructed from scratch
@@ -191,11 +201,12 @@ var _ fs.Fs = MemoryFs
 
 // MemoryObject is an in memory object
 type MemoryObject struct {
-	remote  string
-	modTime time.Time
-	content []byte
-	meta    fs.Metadata
-	fs      fs.Fs
+	remote   string
+	modTime  time.Time
+	content  []byte
+	meta     fs.Metadata
+	fs       fs.Fs
+	mimeType string
 }
 
 // NewMemoryObject returns an in memory Object with the modTime and content passed in
@@ -211,6 +222,12 @@ func NewMemoryObject(remote string, modTime time.Time, content []byte) *MemoryOb
 // WithMetadata adds meta to the MemoryObject
 func (o *MemoryObject) WithMetadata(meta fs.Metadata) *MemoryObject {
 	o.meta = meta
+	return o
+}
+
+// WithMimeType adds mimeType to the MemoryObject
+func (o *MemoryObject) WithMimeType(mimeType string) *MemoryObject {
+	o.mimeType = mimeType
 	return o
 }
 
@@ -279,18 +296,25 @@ func (o *MemoryObject) SetModTime(ctx context.Context, modTime time.Time) error 
 
 // Open opens the file for read.  Call Close() on the returned io.ReadCloser
 func (o *MemoryObject) Open(ctx context.Context, options ...fs.OpenOption) (io.ReadCloser, error) {
-	content := o.content
+	var offset, limit int64 = 0, -1
 	for _, option := range options {
 		switch x := option.(type) {
 		case *fs.RangeOption:
-			content = o.content[x.Start:x.End]
+			offset, limit = x.Decode(o.Size())
 		case *fs.SeekOption:
-			content = o.content[x.Offset:]
+			offset = x.Offset
 		default:
 			if option.Mandatory() {
 				fs.Logf(o, "Unsupported mandatory option: %v", option)
 			}
 		}
+	}
+	content := o.content
+	offset = max(offset, 0)
+	if limit < 0 {
+		content = content[offset:]
+	} else {
+		content = content[offset:min(offset+limit, int64(len(content)))]
 	}
 	return io.NopCloser(bytes.NewBuffer(content)), nil
 }
@@ -322,8 +346,179 @@ func (o *MemoryObject) Metadata(ctx context.Context) (fs.Metadata, error) {
 	return o.meta, nil
 }
 
+// MimeType on the object
+func (o *MemoryObject) MimeType(ctx context.Context) string {
+	return o.mimeType
+}
+
 // Check interfaces
 var (
 	_ fs.Object     = (*MemoryObject)(nil)
+	_ fs.MimeTyper  = (*MemoryObject)(nil)
 	_ fs.Metadataer = (*MemoryObject)(nil)
+)
+
+var retryErrorCodes = []int{429, 500, 502, 503, 504}
+
+func shouldRetry(ctx context.Context, resp *http.Response, err error) (bool, error) {
+	if fserrors.ContextError(ctx, &err) {
+		return false, err
+	}
+	return fserrors.ShouldRetry(err) || fserrors.ShouldRetryHTTP(resp, retryErrorCodes), err
+}
+
+func (o *HTTPObject) fetch(ctx context.Context) error {
+
+	headOpts := rest.Opts{
+		Method:  "HEAD",
+		RootURL: o.url,
+	}
+
+	resp, err := o.client.Call(ctx, &headOpts)
+	if err == nil && resp.StatusCode >= 200 && resp.StatusCode < 300 {
+		defer resp.Body.Close()
+		return o.parseMetadataResponse(resp)
+	}
+	if resp != nil {
+		resp.Body.Close()
+	}
+
+	getOpts := rest.Opts{
+		Method:  "GET",
+		RootURL: o.url,
+		ExtraHeaders: map[string]string{
+			"Range": "bytes=0-0",
+		},
+	}
+
+	resp, err = o.client.Call(ctx, &getOpts)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return fmt.Errorf("metadata fetch failed: %s", resp.Status)
+	}
+
+	return o.parseMetadataResponse(resp)
+}
+
+func (o *HTTPObject) parseMetadataResponse(resp *http.Response) error {
+	var filename string
+
+	if o.dstFileNameFromHeader {
+		if cd := resp.Header.Get("Content-Disposition"); cd != "" {
+			if _, params, err := mime.ParseMediaType(cd); err == nil {
+				if val, ok := params["filename"]; ok {
+					filename = textproto.TrimString(path.Base(strings.ReplaceAll(val, "\\", "/")))
+				}
+			}
+		}
+	} else {
+		filename = path.Base(resp.Request.URL.Path)
+	}
+	o.size = rest.ParseSizeFromHeaders(resp.Header)
+
+	if lm := resp.Header.Get("Last-Modified"); lm != "" {
+		if t, err := http.ParseTime(lm); err == nil {
+			o.modTime = t
+		}
+	}
+	o.remote = filename
+	return nil
+
+}
+
+var HTTPFs httpFs
+
+type httpFs struct{}
+
+func (h httpFs) Features() *fs.Features { return &fs.Features{} }
+func (h httpFs) Hashes() hash.Set       { return hash.Set(hash.None) }
+func (h httpFs) List(ctx context.Context, dir string) (entries fs.DirEntries, err error) {
+	return nil, nil
+}
+func (h httpFs) Mkdir(ctx context.Context, dir string) error { return nil }
+func (h httpFs) Name() string                                { return "http" }
+func (h httpFs) NewObject(ctx context.Context, remote string) (fs.Object, error) {
+	return nil, fs.ErrorObjectNotFound
+}
+func (h httpFs) Precision() time.Duration { return time.Nanosecond }
+func (h httpFs) Put(ctx context.Context, in io.Reader, src fs.ObjectInfo, options ...fs.OpenOption) (fs.Object, error) {
+	return nil, nil
+}
+func (h httpFs) Rmdir(ctx context.Context, dir string) error { return nil }
+func (h httpFs) Root() string                                { return "" }
+func (h httpFs) String() string                              { return "http" }
+
+var _ fs.Fs = HTTPFs
+
+type HTTPObject struct {
+	p                     *fs.Pacer
+	client                *rest.Client
+	url                   string
+	remote                string
+	size                  int64
+	modTime               time.Time
+	dstFileNameFromHeader bool
+}
+
+func NewHTTPObject(ctx context.Context, url string, dstFileNameFromHeader bool) (*HTTPObject, error) {
+	ci := fs.GetConfig(ctx)
+	o := &HTTPObject{url: url, client: rest.NewClient(fshttp.NewClient(ctx)), dstFileNameFromHeader: dstFileNameFromHeader}
+	o.p = fs.NewPacer(ctx, pacer.NewDefault())
+	o.p.SetRetries(ci.LowLevelRetries)
+	err := o.fetch(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return o, nil
+}
+
+func (o *HTTPObject) String() string {
+	if o == nil {
+		return "<nil>"
+	}
+	return o.remote
+}
+
+func (o *HTTPObject) Remote() string                        { return o.remote }
+func (o *HTTPObject) ModTime(ctx context.Context) time.Time { return o.modTime }
+func (o *HTTPObject) Size() int64                           { return o.size }
+func (o *HTTPObject) Fs() fs.Info                           { return HTTPFs }
+func (o *HTTPObject) Storable() bool                        { return true }
+func (o *HTTPObject) Open(ctx context.Context, options ...fs.OpenOption) (io.ReadCloser, error) {
+	var (
+		err error
+		res *http.Response
+	)
+
+	fs.FixRangeOption(options, o.size)
+	err = o.p.Call(func() (bool, error) {
+		opts := rest.Opts{
+			Method:  "GET",
+			RootURL: o.url,
+			Options: options,
+		}
+		res, err = o.client.Call(ctx, &opts)
+		return shouldRetry(ctx, res, err)
+	})
+
+	if err != nil {
+		return nil, fmt.Errorf("Open failed: %w", err)
+	}
+	return res.Body, nil
+}
+func (o *HTTPObject) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, options ...fs.OpenOption) error {
+	return nil
+}
+func (o *HTTPObject) Remove(ctx context.Context) error                        { return nil }
+func (o *HTTPObject) SetModTime(ctx context.Context, modTime time.Time) error { return nil }
+func (o *HTTPObject) Hash(ctx context.Context, r hash.Type) (string, error) {
+	return "", hash.ErrUnsupported
+}
+
+var (
+	_ fs.Object = (*HTTPObject)(nil)
 )

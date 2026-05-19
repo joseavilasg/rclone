@@ -62,7 +62,10 @@ time instead of the current time. Times may be specified as one of:
 
 Note that value of ` + "`--timestamp`" + ` is in UTC. If you want local time
 then add the ` + "`--localtime`" + ` flag.
-`,
+
+Metadata can be added when creating a new file with ` + "`--metadata-set`" + `.
+For example:
+  rclone touch remote:path -M --metadata-set key=value`,
 	Annotations: map[string]string{
 		"versionIntroduced": "v1.39",
 		"groups":            "Filter,Listing,Important",
@@ -124,10 +127,10 @@ func timeOfTouch() (time.Time, error) {
 }
 
 // createEmptyObject creates an empty object (file) with specified timestamp
-func createEmptyObject(ctx context.Context, remote string, modTime time.Time, f fs.Fs) error {
+func createEmptyObject(ctx context.Context, remote string, modTime time.Time, f fs.Fs, options []fs.OpenOption) error {
 	var buffer []byte
 	src := object.NewStaticObjectInfo(remote, modTime, int64(len(buffer)), true, nil, f)
-	_, err := f.Put(ctx, bytes.NewBuffer(buffer), src)
+	_, err := f.Put(ctx, bytes.NewBuffer(buffer), src, options...)
 	return err
 }
 
@@ -164,7 +167,8 @@ func Touch(ctx context.Context, f fs.Fs, remote string) error {
 				return nil
 			}
 			fs.Debugf(f, "Touching (creating) %q", remote)
-			if err = createEmptyObject(ctx, remote, t, f); err != nil {
+			options := fs.MetadataAsOpenOptions(ctx)
+			if err = createEmptyObject(ctx, remote, t, f, options); err != nil {
 				return fmt.Errorf("failed to touch (create): %w", err)
 			}
 		}
