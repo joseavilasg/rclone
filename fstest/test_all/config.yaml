@@ -707,3 +707,11 @@ backends:
    fastlist: false
    extratime: 2.0
    listretries: 5
+
+ - backend:  "teldrive"
+   remote:   "TestTeldrive:"
+   ignoretests:
+     - TestIntegration/FsMkdir/FsEncoding/invalid_UTF-8
+   fastlist: false
+
+
