@@ -14,6 +14,7 @@ require (
 	github.com/FilenCloudDienste/filen-sdk-go v0.0.38
 	github.com/Files-com/files-sdk-go/v3 v3.3.40
 	github.com/Max-Sum/base32768 v0.0.0-20230304063302-18e6ce5945fd
+	github.com/PuerkitoBio/goquery v1.11.0
 	github.com/a1ex3/zstd-seekable-format-go/pkg v0.10.0
 	github.com/a8m/tree v0.0.0-20240104212747-2c8764a5f17e
 	github.com/aalpar/deheap v1.0.0
@@ -118,7 +119,6 @@ require (
 	github.com/ProtonMail/go-mime v0.0.0-20230322103455-7d82a3887f2f // indirect
 	github.com/ProtonMail/go-srp v0.0.7 // indirect
 	github.com/ProtonMail/gopenpgp/v2 v2.9.0 // indirect
-	github.com/PuerkitoBio/goquery v1.11.0 // indirect
 	github.com/STARRY-S/zip v0.2.3 // indirect
 	github.com/akavel/rsrc v0.10.2 // indirect
 	github.com/anacrolix/generics v0.2.0 // indirect
