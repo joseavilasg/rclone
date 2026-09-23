@@ -1,9 +1,12 @@
-name: Rclone Build
+name: Rclone Build (Full)
 
 on:
-  push:
-    tags:
-      - "**"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Version for the GitHub release and embedded in the binaries (e.g. v1.75.1-release)
+        required: false
+        default: v1.75.1-release
 
 jobs:
   build:
@@ -11,7 +14,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        job_name: ["linux"]
+        job_name: ["linux", "windows"]
 
         include:
           - job_name: linux
@@ -20,6 +23,26 @@ jobs:
             gotags: cmount
             cgo: "0"
             build_flags: '-include "^(linux/amd64|linux/arm64|linux/arm-v7)"'
+
+          - job_name: windows
+            os: windows-latest
+            go: "~1.26.6"
+            gotags: cmount
+            cgo: "0"
+            build_flags: '-include "^(windows/amd64|windows/arm64)"'
+            build_args: "-buildmode exe"
+
+          - job_name: mac_amd64
+            os: macos-latest
+            go: "~1.26.6"
+            gotags: "cmount"
+            build_flags: '-include "^darwin/amd64" -cgo'
+
+          - job_name: mac_arm64
+            os: macos-latest
+            go: "~1.26.6"
+            gotags: "cmount"
+            build_flags: '-include "^darwin/arm64" -cgo -macos-arch arm64 -cgo-cflags=-I/usr/local/include -cgo-ldflags=-L/usr/local/lib'
 
     name: ${{ matrix.job_name }}
 
@@ -103,6 +126,36 @@ jobs:
           sudo rm -f /usr/local/bin/fusermount /usr/local/bin/fusermount3
         if: matrix.os == 'ubuntu-latest'
 
+      - name: Install Libraries on macOS
+        shell: bash
+        run: |
+          # https://github.com/Homebrew/brew/issues/15621#issuecomment-1619266788
+          # https://github.com/orgs/Homebrew/discussions/4612#discussioncomment-6319008
+          unset HOMEBREW_NO_INSTALL_FROM_API
+          brew untap --force homebrew/core
+          brew untap --force homebrew/cask
+          brew untap --force aws/tap
+          brew update
+          brew install --cask macfuse
+          brew install git-annex git-annex-remote-rclone
+        if: matrix.os == 'macos-latest'
+
+      - name: Install Libraries on Windows
+        shell: powershell
+        run: |
+          $ProgressPreference = 'SilentlyContinue'
+          choco install -y winfsp zip
+          echo "CPATH=C:\Program Files\WinFsp\inc\fuse;C:\Program Files (x86)\WinFsp\inc\fuse" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          if ($env:GOARCH -eq "386") {
+            choco install -y mingw --forcex86 --force
+            echo "C:\\ProgramData\\chocolatey\\lib\\mingw\\tools\\install\\mingw32\\bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+          }
+          # Copy mingw32-make.exe to make.exe so the same command line
+          # can be used on Windows as on macOS and Linux
+          $path = (get-command mingw32-make.exe).Path
+          Copy-Item -Path $path -Destination (Join-Path (Split-Path -Path $path) 'make.exe')
+        if: matrix.os == 'windows-latest'
+
       - name: Print Go version and environment
         shell: bash
         run: |
@@ -119,7 +172,7 @@ jobs:
         shell: bash
         run: |
           if [[ "${{ matrix.os }}" == "ubuntu-latest" ]]; then make release_dep_linux ; fi
-          make cross
+          make cross TAG=${{ inputs.version }}
 
       - name: Upload Binary
         uses: actions/upload-artifact@v4
@@ -138,10 +191,64 @@ jobs:
           modcache=$(go env GOMODCACHE | tr '\\' '/')
           find "$modcache/cache/download" -name '*.zip' -type f -delete 2>/dev/null || true
 
+  android:
+    timeout-minutes: 30
+    name: "android-all"
+    runs-on: ubuntu-latest
+    steps:
+      - name: Get runner parameters
+        id: get-runner-parameters
+        run: |
+          echo "year-week=$(date -u "+%Y%V")" >> $GITHUB_OUTPUT
+          echo "runner-os-version=$ImageOS" >> $GITHUB_OUTPUT
+
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: ">=1.24.0-rc.1"
+
+      - name: Go module cache
+        uses: actions/cache@v4
+        with:
+          path: ~/go/pkg/mod
+          key: ${{ runner.os }}-go-${{ hashFiles('**/go.sum') }}
+          restore-keys: |
+            ${{ runner.os }}-go-
+
+      - name: arm64-v8a Set environment variables
+        shell: bash
+        run: |
+          echo "CC=$(echo $ANDROID_NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android21-clang)" >> $GITHUB_ENV
+          echo "CC_FOR_TARGET=$CC" >> $GITHUB_ENV
+          echo 'GOOS=android' >> $GITHUB_ENV
+          echo 'GOARCH=arm64' >> $GITHUB_ENV
+          echo 'CGO_ENABLED=1' >> $GITHUB_ENV
+          echo 'CGO_LDFLAGS=-fuse-ld=lld -s -w' >> $GITHUB_ENV
+
+      - name: arm64-v8a build
+        run: go build -v -tags android -trimpath -ldflags '-s -X github.com/rclone/rclone/fs.Version='${{ github.ref_name }} -o build/rclone-armv8a .
+
+      - name: Package into Zip
+        run: |
+          cd build
+          mv rclone-armv8a rclone
+          zip -r rclone-${{ github.ref_name }}-android-arm64.zip rclone
+
+      - name: Upload Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: rclone-android
+          path: ${{ github.workspace }}/build/rclone-*.zip
+          retention-days: 1
+
   release:
     name: Create Release
     runs-on: ubuntu-latest
-    needs: [build]
+    needs: [build, android]
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -165,4 +272,4 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          make upload_github
+          make upload_github TAG=${{ inputs.version }}
