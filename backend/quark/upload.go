@@ -15,6 +15,7 @@ import (
 
 	"github.com/rclone/rclone/backend/quark/api"
 	"github.com/rclone/rclone/fs"
+	fshash "github.com/rclone/rclone/fs/hash"
 )
 
 // uploadPartRetry uploads a single part, retrying re-readable bodies up to 3
@@ -64,18 +65,74 @@ func (f *Fs) uploadCommit(ctx context.Context, pre api.UpPreResp, md5Sum, sha1Su
 	return nil
 }
 
-// uploadStream uploads size bytes from in as a new file at remote, hashing the
-// parts as they stream so the upload stays single-pass.
-func (f *Fs) uploadStream(ctx context.Context, remote string, size int64, formatType string, in io.Reader) error {
+// sourceHashes returns the md5 and sha1 of the source object when it can
+// provide both without us having to read the stream, and ok=false otherwise.
+// quark looks the content up by md5+sha1 together, so the instant-dedupe
+// pre-check only makes sense when both are present.
+func sourceHashes(ctx context.Context, src fs.ObjectInfo) (md5Sum, sha1Sum string, ok bool) {
+	if src == nil {
+		return "", "", false
+	}
+	md5Sum, err := src.Hash(ctx, fshash.MD5)
+	if err != nil || md5Sum == "" {
+		return "", "", false
+	}
+	sha1Sum, err = src.Hash(ctx, fshash.SHA1)
+	if err != nil || sha1Sum == "" {
+		return "", "", false
+	}
+	return md5Sum, sha1Sum, true
+}
+
+// dedupePrecheck asks the server whether the source content already exists,
+// using the hashes the source provides. finished=false means either the source
+// could not provide both hashes (no pre-check possible) or it is a miss and the
+// upload must proceed. finished=true means quark has the content already: the
+// entry was created instantly by that response (秒传) and the upload must be
+// skipped entirely.
+func (f *Fs) dedupePrecheck(ctx context.Context, src fs.ObjectInfo, pre api.UpPreResp) (finished bool, err error) {
+	md5Sum, sha1Sum, ok := sourceHashes(ctx, src)
+	if !ok {
+		return false, nil
+	}
+	finished, err = f.client.UploadHash(ctx, pre, md5Sum, sha1Sum)
+	if err != nil {
+		return false, err
+	}
+	if finished {
+		fs.Debugf(pre.Data.TaskId, "quark: content already present, instant-deduped (source hash)")
+	}
+	return finished, nil
+}
+
+// newUploadTask creates the destination directory if needed and asks the server
+// for an upload task for remote.
+func (f *Fs) newUploadTask(ctx context.Context, remote string, size int64, formatType string) (api.UpPreResp, error) {
 	dir, leaf := splitRemote(remote)
 	parentID, err := f.resolveDirCreate(ctx, dir)
 	if err != nil {
-		return err
+		return api.UpPreResp{}, err
 	}
 	pre, err := f.client.UploadPre(ctx, f.opt.Enc.FromStandardName(leaf), parentID, size, formatType)
 	if err != nil {
-		return fmt.Errorf("quark: upload pre %q: %w", remote, err)
+		return api.UpPreResp{}, fmt.Errorf("quark: upload pre %q: %w", remote, err)
 	}
+	return pre, nil
+}
+
+// uploadStream uploads size bytes from in as a new file at remote, hashing the
+// parts as they stream so the upload stays single-pass.
+func (f *Fs) uploadStream(ctx context.Context, remote string, size int64, formatType string, in io.Reader) error {
+	pre, err := f.newUploadTask(ctx, remote, size, formatType)
+	if err != nil {
+		return err
+	}
+	return f.uploadPartsAndCommit(ctx, remote, pre, formatType, size, in)
+}
+
+// uploadPartsAndCommit streams size bytes from in as parts of the pre upload
+// task, hashing inline as they stream, and commits the completed upload.
+func (f *Fs) uploadPartsAndCommit(ctx context.Context, remote string, pre api.UpPreResp, formatType string, size int64, in io.Reader) error {
 	partSize := int64(pre.Metadata.PartSize)
 	if partSize <= 0 {
 		return fmt.Errorf("quark: pre response has bad part size %d", pre.Metadata.PartSize)
@@ -94,22 +151,37 @@ func (f *Fs) uploadStream(ctx context.Context, remote string, size int64, format
 		}
 		fs.Debugf(remote, "quark: uploaded %d parts (%d bytes)", len(etags), size)
 	}
-	if err := f.uploadCommit(ctx, pre, w.sumMD5(), w.sumSHA1(), w.etags); err != nil {
-		return fmt.Errorf("quark: upload commit %q: %w", remote, err)
-	}
-	return nil
+	return f.uploadCommit(ctx, pre, w.sumMD5(), w.sumSHA1(), w.etags)
 }
 
-// Put uploads the object to the remote
+// Put uploads the object to the remote. When the source can provide both hashes
+// the server is asked up front: a hit creates the entry instantly and skips the
+// transfer entirely (秒传) instead of uploading first and deduping afterwards.
 func (f *Fs) Put(ctx context.Context, in io.Reader, src fs.ObjectInfo, options ...fs.OpenOption) (fs.Object, error) {
 	size := src.Size()
 	if size < 0 {
 		return nil, fmt.Errorf("quark: cannot upload a stream of unknown size")
 	}
-	if err := f.uploadStream(ctx, src.Remote(), size, fs.MimeType(ctx, src), in); err != nil {
+	remote := src.Remote()
+	formatType := fs.MimeType(ctx, src)
+	pre, err := f.newUploadTask(ctx, remote, size, formatType)
+	if err != nil {
 		return nil, err
 	}
-	return f.NewObject(ctx, src.Remote())
+	finished, err := f.dedupePrecheck(ctx, src, pre)
+	if err != nil {
+		return nil, err
+	}
+	if finished {
+		// the entry was created by the instant-dedupe response; the visibility
+		// throttle makes it findable right away on the lookup below.
+		time.Sleep(time.Second)
+		return f.NewObject(ctx, remote)
+	}
+	if err := f.uploadPartsAndCommit(ctx, remote, pre, formatType, size, in); err != nil {
+		return nil, fmt.Errorf("quark: upload commit %q: %w", remote, err)
+	}
+	return f.NewObject(ctx, remote)
 }
 
 // PutStream uploads the object with unknown size, spooling to a temp file
@@ -140,6 +212,7 @@ type chunkWriter struct {
 	f        *Fs
 	pre      api.UpPreResp
 	mimeType string
+	deduped  bool // content already exists: chunks are consumed and discarded
 
 	mu      sync.Mutex
 	etags   []string
@@ -147,29 +220,32 @@ type chunkWriter struct {
 	sha1Sum hash.Hash
 }
 
-// OpenChunkWriter returns a chunk writer for the OSS multipart upload
+// OpenChunkWriter returns a chunk writer for the OSS multipart upload. When the
+// source can provide both hashes the server is asked before any chunk is read:
+// a hit creates the entry instantly and the writer runs in discard mode so no
+// part is ever uploaded (秒传), the core's chunk reads still count as progress.
 func (f *Fs) OpenChunkWriter(ctx context.Context, remote string, src fs.ObjectInfo, options ...fs.OpenOption) (fs.ChunkWriterInfo, fs.ChunkWriter, error) {
 	if src.Size() <= 0 {
 		return fs.ChunkWriterInfo{}, nil, fmt.Errorf("quark: OpenChunkWriter requires a positive size")
 	}
-	dir, leaf := splitRemote(remote)
-	parentID, err := f.resolveDirCreate(ctx, dir)
+	formatType := fs.MimeType(ctx, src)
+	pre, err := f.newUploadTask(ctx, remote, src.Size(), formatType)
 	if err != nil {
 		return fs.ChunkWriterInfo{}, nil, err
-	}
-	formatType := fs.MimeType(ctx, src)
-	pre, err := f.client.UploadPre(ctx, f.opt.Enc.FromStandardName(leaf), parentID, src.Size(), formatType)
-	if err != nil {
-		return fs.ChunkWriterInfo{}, nil, fmt.Errorf("quark: upload pre %q: %w", remote, err)
 	}
 	partSize := int64(pre.Metadata.PartSize)
 	if partSize <= 0 {
 		return fs.ChunkWriterInfo{}, nil, fmt.Errorf("quark: pre response has bad part size %d", pre.Metadata.PartSize)
 	}
+	deduped, err := f.dedupePrecheck(ctx, src, pre)
+	if err != nil {
+		return fs.ChunkWriterInfo{}, nil, err
+	}
 	w := &chunkWriter{
 		f:        f,
 		pre:      pre,
 		mimeType: formatType,
+		deduped:  deduped,
 		md5Sum:   md5.New(),
 		sha1Sum:  sha1.New(),
 	}
@@ -181,6 +257,11 @@ func (f *Fs) OpenChunkWriter(ctx context.Context, remote string, src fs.ObjectIn
 
 // WriteChunk writes a chunk of the object. chunkNumber starts at 0.
 func (w *chunkWriter) WriteChunk(ctx context.Context, chunkNumber int, reader io.ReadSeeker) (int64, error) {
+	if w.deduped {
+		// the entry already exists; consume the chunk so the core's accounting
+		// and read loop keep working, but never upload a part.
+		return io.Copy(io.Discard, reader)
+	}
 	n, err := reader.Seek(0, io.SeekEnd)
 	if err != nil {
 		return 0, err
@@ -242,8 +323,14 @@ func (w *chunkWriter) uploadParts(ctx context.Context, size, partSize int64, in 
 	return w.etags, nil
 }
 
-// Close commits the completed upload
+// Close commits the completed upload. In dedupe mode the entry was already
+// created by the instant-dedupe response, so this only waits the visibility
+// throttle before the core looks the object up.
 func (w *chunkWriter) Close(ctx context.Context) error {
+	if w.deduped {
+		time.Sleep(time.Second)
+		return nil
+	}
 	return w.f.uploadCommit(ctx, w.pre, w.sumMD5(), w.sumSHA1(), w.etags)
 }
 

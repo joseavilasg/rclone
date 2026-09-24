@@ -73,9 +73,15 @@ upload progress shown by rclone therefore reflects the real upload, not
 a buffering stage: uploading a large file shows the percentage of bytes
 actually written to Quark.
 
-Uploads do not send a file hash. Quark's on-the-fly deduplication
-(秒传) check is skipped; rclone already avoids re-copying files that
-already exist with the same size when a validation method is in use.
+Uploads do not send a file hash when the source cannot provide one. When
+the source can give both MD5 and SHA-1 without the backend reading the
+stream (most remote backends expose them in their metadata), the backend
+asks Quark up front whether it already has the content: a hit creates the
+file instantly - Quark's 秒传 deduplication - and skips the transfer
+entirely, so a 3 GB file that already exists in Quark is never re-uploaded
+from a remote source. A miss (or a hash-less source) uploads as described
+above. rclone also avoids re-copying files that already exist with the
+same size when a validation method is in use.
 
 ## Downloads
 

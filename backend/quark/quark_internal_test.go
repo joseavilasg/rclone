@@ -15,6 +15,8 @@ import (
 
 	"github.com/rclone/rclone/backend/quark/api"
 	"github.com/rclone/rclone/fs"
+	fshash "github.com/rclone/rclone/fs/hash"
+	"github.com/rclone/rclone/fs/object"
 	"github.com/rclone/rclone/lib/encoder"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -327,4 +329,127 @@ func TestUploadCommitDedupeVisible(t *testing.T) {
 	o, err := f.NewObject(ctx, "dup.bin")
 	require.NoError(t, err, "object must be findable immediately after an instant-deduped commit")
 	assert.Equal(t, int64(12), o.Size())
+}
+
+// newUploadAPIFake is a fake quark upload API: pre + hash pretending a task.
+// Every OSS-flavored endpoint (auth/commit/finish) fails loudly so any
+// accidental network to them trips the test. The listing advertises one object
+// so NewObject succeeds after an instant-dedupe.
+func newUploadAPIFake(t *testing.T, hashFinish bool, hashCount *int) (*Fs, context.Context) {
+	t.Helper()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.Contains(r.URL.Path, "/file/upload/pre"):
+			io.WriteString(w, `{"status":200,"code":0,"data":{"task_id":"t1","upload_id":"up1","obj_key":"o1","upload_url":"x","fid":"f1","bucket":"b","auth_info":"a"},"metadata":{"part_size":4194304}}`)
+		case strings.Contains(r.URL.Path, "/file/update/hash"):
+			if hashCount != nil {
+				*hashCount++
+			}
+			finish := "false"
+			if hashFinish {
+				finish = "true"
+			}
+			io.WriteString(w, `{"status":200,"code":0,"data":{"finish":`+finish+`,"fid":"f1"}}`)
+		case strings.Contains(r.URL.Path, "/file/sort"):
+			io.WriteString(w, `{"status":200,"code":0,"data":{"list":[{"fid":"f1","file_name":"dup.bin","size":12,"file":true}]},"metadata":{"_size":100,"_page":1,"_count":0,"_total":0,"way":"normal"}}`)
+		default:
+			t.Errorf("unexpected upload API call: %s", r.URL.Path)
+			w.WriteHeader(http.StatusInternalServerError)
+		}
+	}))
+	t.Cleanup(srv.Close)
+	ctx, _ := fs.AddConfig(context.Background())
+	client := api.NewClient(ctx, srv.Client(), srv.Client(), srv.URL+"/1/clouddrive", "https://pan.quark.cn", "ucpro", "")
+	f := &Fs{
+		client: client,
+		dirIDs: map[string]string{},
+		opt:    Options{RootFolderID: "0"},
+	}
+	return f, ctx
+}
+
+func dupSrc() fs.ObjectInfo {
+	return object.NewStaticObjectInfo("dup.bin", time.Now(), 12, true, map[fshash.Type]string{
+		fshash.MD5:  "bf13fc19e5151ac57d4252e0e0f87abe",
+		fshash.SHA1: "3ab6543c08a75f292a5ecedac87ec41642d12166",
+	}, nil)
+}
+
+func noHashSrc() fs.ObjectInfo {
+	return object.NewStaticObjectInfo("dup.bin", time.Now(), 12, true, nil, nil)
+}
+
+// readCounter counts how many bytes a wrapped reader actually provided, to
+// prove a stream was (or was not) consumed.
+type readCounter struct {
+	r io.Reader
+	n *int64
+}
+
+func (rc *readCounter) Read(p []byte) (int, error) {
+	n, err := rc.r.Read(p)
+	if rc.n != nil {
+		*rc.n += int64(n)
+	}
+	return n, err
+}
+
+// TestPutPrecheckInstantDedupe pins that Put asks the server with the
+// source-provided hashes BEFORE touching the stream: on a hit the entry is
+// created instantly, no part is uploaded, the source stream is never read and
+// the object comes back from a fresh lookup.
+func TestPutPrecheckInstantDedupe(t *testing.T) {
+	var hashCount int
+	f, ctx := newUploadAPIFake(t, true, &hashCount)
+
+	var reads int64
+	counted := &readCounter{r: bytes.NewReader([]byte("hello world!")), n: &reads}
+	o, err := f.Put(ctx, counted, dupSrc())
+	require.NoError(t, err)
+	assert.Equal(t, int64(12), o.Size())
+	assert.Equal(t, int64(0), reads, "the source stream must never be read on a dedupe hit")
+	assert.Equal(t, 1, hashCount, "update/hash runs exactly once, as the pre-check")
+}
+
+// TestOpenChunkWriterPrecheckDedupe pins that OpenChunkWriter runs the
+// pre-check before any chunk is handed in and, on a hit, returns a writer that
+// consumes and discards chunks without ever uploading a part.
+func TestOpenChunkWriterPrecheckDedupe(t *testing.T) {
+	var hashCount int
+	f, ctx := newUploadAPIFake(t, true, &hashCount)
+
+	info, w, err := f.OpenChunkWriter(ctx, "dup.bin", dupSrc())
+	require.NoError(t, err)
+	cw, ok := w.(*chunkWriter)
+	require.True(t, ok, "OpenChunkWriter must return a *chunkWriter")
+	assert.True(t, cw.deduped, "on a hit the writer must run in dedupe mode")
+	assert.Equal(t, int64(4194304), info.ChunkSize)
+
+	n, err := w.WriteChunk(ctx, 0, bytes.NewReader([]byte("hello world!")))
+	require.NoError(t, err)
+	assert.Equal(t, int64(12), n, "the chunk must be consumed so the read loop keeps working")
+	require.NoError(t, w.Close(ctx))
+
+	assert.Equal(t, 1, hashCount, "the pre-check is the only hash round trip")
+}
+
+// TestOpenChunkWriterPrecheckMiss pins that on a miss (or when the source has
+// no hashes) OpenChunkWriter is NOT in dedupe mode and the upload proceeds
+// through the normal writer.
+func TestOpenChunkWriterPrecheckMiss(t *testing.T) {
+	// miss with source hashes: the pre-check runs once, then a normal writer
+	var hashCount int
+	f, ctx := newUploadAPIFake(t, false, &hashCount)
+	_, w, err := f.OpenChunkWriter(ctx, "dup.bin", dupSrc())
+	require.NoError(t, err)
+	assert.False(t, w.(*chunkWriter).deduped, "a miss must keep the normal upload path")
+	assert.Equal(t, 1, hashCount)
+
+	// source without hashes: the pre-check is skipped entirely
+	var noHashCount int
+	f2, ctx2 := newUploadAPIFake(t, true, &noHashCount)
+	_, w2, err := f2.OpenChunkWriter(ctx2, "dup.bin", noHashSrc())
+	require.NoError(t, err)
+	assert.False(t, w2.(*chunkWriter).deduped)
+	assert.Equal(t, 0, noHashCount, "a hash-less source must skip the pre-check entirely")
 }
