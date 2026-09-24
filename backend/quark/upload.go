@@ -73,6 +73,7 @@ func sourceHashes(ctx context.Context, src fs.ObjectInfo) (md5Sum, sha1Sum strin
 	if src == nil {
 		return "", "", false
 	}
+	fs.Infof(src, "quark: computing source hashes to check if the upload already exists")
 	md5Sum, err := src.Hash(ctx, fshash.MD5)
 	if err != nil || md5Sum == "" {
 		return "", "", false
@@ -100,7 +101,7 @@ func (f *Fs) dedupePrecheck(ctx context.Context, src fs.ObjectInfo, pre api.UpPr
 		return false, err
 	}
 	if finished {
-		fs.Debugf(pre.Data.TaskId, "quark: content already present, instant-deduped (source hash)")
+		fs.Infof(pre.Data.TaskId, "quark: content already present, instant-deduped (source hash)")
 	}
 	return finished, nil
 }
@@ -218,6 +219,13 @@ type chunkWriter struct {
 	etags   []string
 	md5Sum  hash.Hash
 	sha1Sum hash.Hash
+}
+
+// AlreadyExists implements fs.ChunkWriterAlreadyExistser: when the dedupe
+// pre-check hit, the object already exists on quark, so multiThreadCopy skips
+// reading the source and writing chunks entirely.
+func (w *chunkWriter) AlreadyExists() bool {
+	return w.deduped
 }
 
 // OpenChunkWriter returns a chunk writer for the OSS multipart upload. When the

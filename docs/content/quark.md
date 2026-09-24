@@ -78,10 +78,12 @@ the source can give both MD5 and SHA-1 without the backend reading the
 stream (most remote backends expose them in their metadata), the backend
 asks Quark up front whether it already has the content: a hit creates the
 file instantly - Quark's 秒传 deduplication - and skips the transfer
-entirely, so a 3 GB file that already exists in Quark is never re-uploaded
-from a remote source. A miss (or a hash-less source) uploads as described
-above. rclone also avoids re-copying files that already exist with the
-same size when a validation method is in use.
+entirely, in both the single-stream and the multi-thread copy paths (the
+chunk writer reports the object already exists and rclone does not even
+read the source), so a 3 GB file that already exists in Quark is neither
+re-uploaded nor re-downloaded from a remote source. A miss (or a hash-less
+source) uploads as described above. rclone also avoids re-copying files
+that already exist with the same size when a validation method is in use.
 
 ## Downloads
 

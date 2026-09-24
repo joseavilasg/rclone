@@ -767,6 +767,18 @@ type ChunkWriter interface {
 	Abort(ctx context.Context) error
 }
 
+// ChunkWriterAlreadyExistser is an optional interface for ChunkWriter.
+//
+// multiThreadCopy calls it before reading the source object. If AlreadyExists
+// returns true the object is already on the destination (e.g. an upload
+// backend whose dedupe pre-check hit), so the transfer is skipped entirely:
+// the source is never read and no chunks are written.
+type ChunkWriterAlreadyExistser interface {
+	// AlreadyExists returns true when the object already exists on the
+	// destination and the writer has nothing to transfer.
+	AlreadyExists() bool
+}
+
 // UserInfoer is an optional interface for Fs
 type UserInfoer interface {
 	// UserInfo returns info about the connected user

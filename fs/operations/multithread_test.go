@@ -92,6 +92,75 @@ func TestDoMultiThreadCopy(t *testing.T) {
 	assert.True(t, doMultiThreadCopy(ctx, f, src))
 }
 
+// alreadyExistsWriter is a fs.ChunkWriter whose AlreadyExists() returns true,
+// as an upload backend reports when its dedupe pre-check hit. WriteChunk and
+// Abort panic: multiThreadCopy must skip reading the source and writing chunks
+// entirely.
+type alreadyExistsWriter struct {
+	closeCalled bool
+}
+
+func (w *alreadyExistsWriter) WriteChunk(ctx context.Context, chunkNumber int, reader io.ReadSeeker) (int64, error) {
+	panic("WriteChunk must not be called on a chunk writer reporting AlreadyExists")
+}
+
+func (w *alreadyExistsWriter) Close(ctx context.Context) error {
+	w.closeCalled = true
+	return nil
+}
+
+func (w *alreadyExistsWriter) Abort(ctx context.Context) error {
+	panic("Abort must not be called on a chunk writer reporting AlreadyExists")
+}
+
+func (w *alreadyExistsWriter) AlreadyExists() bool { return true }
+
+// openCountingSource is a source whose Open fails: multiThreadCopy must never
+// read the source when the chunk writer reports AlreadyExists.
+type openCountingSource struct {
+	fs.Object
+	opens int
+}
+
+func (o *openCountingSource) Open(ctx context.Context, options ...fs.OpenOption) (io.ReadCloser, error) {
+	o.opens++
+	return nil, errors.New("source must not be opened when the chunk writer reports AlreadyExists")
+}
+
+// TestMultithreadCopyChunkWriterAlreadyExistser pins that multiThreadCopy skips
+// the transfer when OpenChunkWriter returns a writer reporting AlreadyExists:
+// the source is never read, the writer is closed once and the fresh lookup
+// wins.
+func TestMultithreadCopyChunkWriterAlreadyExistser(t *testing.T) {
+	ctx := context.Background()
+	f, err := mockfs.NewFs(ctx, "potato", "", nil)
+	require.NoError(t, err)
+
+	writer := &alreadyExistsWriter{}
+	f.Features().OpenChunkWriter = func(ctx context.Context, remote string, src fs.ObjectInfo, options ...fs.OpenOption) (fs.ChunkWriterInfo, fs.ChunkWriter, error) {
+		return fs.ChunkWriterInfo{ChunkSize: int64(4 * fs.Mebi), Concurrency: 1}, writer, nil
+	}
+
+	result := mockobject.New("file.bin").WithContent([]byte("already present"), mockobject.SeekModeNone)
+	f.(*mockfs.Fs).AddObject(result)
+
+	srcObj := mockobject.New("file.bin").WithContent([]byte(random.String(2*(1<<20))), mockobject.SeekModeNone)
+	srcFs, err := mockfs.NewFs(ctx, "sausage", "", nil)
+	require.NoError(t, err)
+	srcObj.SetFs(srcFs)
+	src := &openCountingSource{Object: srcObj}
+
+	accounting.GlobalStats().ResetCounters()
+	tr := accounting.GlobalStats().NewTransfer(src, nil)
+	dst, err := multiThreadCopy(ctx, f, "file.bin", src, 4, tr)
+	defer func() { tr.Done(ctx, err) }()
+
+	require.NoError(t, err)
+	assert.Same(t, result, dst, "the fresh lookup must return the existing object")
+	assert.Equal(t, 0, src.opens, "the source must never be read when the chunk writer reports AlreadyExists")
+	assert.True(t, writer.closeCalled, "the chunk writer must be closed before the lookup")
+}
+
 func TestMultithreadCalculateNumChunks(t *testing.T) {
 	for _, test := range []struct {
 		size          int64
