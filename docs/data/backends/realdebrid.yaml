@@ -1,0 +1,27 @@
+backend: realdebrid
+name: real-debrid.com
+tier: Tier 4
+maintainers: External
+features_score: 0
+integration_tests: N/A
+data_integrity: N/A
+performance: Medium
+adoption: Some use
+docs: Full
+security: High
+virtual: false
+remote: 'TestRealDebrid:'
+features:
+- About
+- CanHaveEmptyDirectories
+- CaseInsensitive
+- DirCacheFlush
+- DirMove
+- Move
+- PublicLink
+- Purge
+- Put
+- PutUnchecked
+- ReadMimeType
+hashes: []
+precision: 3153600000000000000
