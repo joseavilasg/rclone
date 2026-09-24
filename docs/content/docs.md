@@ -82,6 +82,7 @@ See the following for detailed instructions for
 - [put.io](/putio/)
 - [Proton Drive](/protondrive/)
 - [QingStor](/qingstor/)
+- [Quark Drive](/quark/)
 - [Quatrix by Maytech](/quatrix/)
 - [real-debrid.com](/realdebrid/)
 - [rsync.net](/sftp/#rsync-net)
