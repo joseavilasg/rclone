@@ -423,6 +423,9 @@ func TestOpenChunkWriterPrecheckDedupe(t *testing.T) {
 	cw, ok := w.(*chunkWriter)
 	require.True(t, ok, "OpenChunkWriter must return a *chunkWriter")
 	assert.True(t, cw.deduped, "on a hit the writer must run in dedupe mode")
+	alreadyExists, ok := w.(fs.ChunkWriterAlreadyExistser)
+	require.True(t, ok, "the chunk writer must implement fs.ChunkWriterAlreadyExistser")
+	assert.True(t, alreadyExists.AlreadyExists(), "a dedupe-hit writer must report AlreadyExists so the core skips the transfer")
 	assert.Equal(t, int64(4194304), info.ChunkSize)
 
 	n, err := w.WriteChunk(ctx, 0, bytes.NewReader([]byte("hello world!")))
@@ -443,6 +446,7 @@ func TestOpenChunkWriterPrecheckMiss(t *testing.T) {
 	_, w, err := f.OpenChunkWriter(ctx, "dup.bin", dupSrc())
 	require.NoError(t, err)
 	assert.False(t, w.(*chunkWriter).deduped, "a miss must keep the normal upload path")
+	assert.False(t, w.(fs.ChunkWriterAlreadyExistser).AlreadyExists(), "a miss must not report AlreadyExists or the core would skip a real upload")
 	assert.Equal(t, 1, hashCount)
 
 	// source without hashes: the pre-check is skipped entirely

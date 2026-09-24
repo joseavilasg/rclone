@@ -450,6 +450,21 @@ func multiThreadCopy(ctx context.Context, f fs.Fs, remote string, src fs.Object,
 		return nil, fmt.Errorf("multi-thread copy: failed to open chunk writer: %w", err)
 	}
 
+	// If the chunk writer already holds the object (e.g. an upload backend
+	// whose dedupe pre-check hit), there is nothing to transfer: skip
+	// reading the source entirely.
+	if w, ok := chunkWriter.(fs.ChunkWriterAlreadyExistser); ok && w.AlreadyExists() {
+		fs.Infof(src, "multi-thread copy: destination already contains the object, skipping transfer")
+		if err := chunkWriter.Close(ctx); err != nil {
+			return nil, fmt.Errorf("multi-thread copy: failed to close object after copy: %w", err)
+		}
+		obj, err := f.NewObject(ctx, remote)
+		if err != nil {
+			return nil, fmt.Errorf("multi-thread copy: failed to find object after copy: %w", err)
+		}
+		return obj, nil
+	}
+
 	uploadCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	uploadedOK := false
