@@ -73,6 +73,10 @@ upload progress shown by rclone therefore reflects the real upload, not
 a buffering stage: uploading a large file shows the percentage of bytes
 actually written to Quark.
 
+Large files go through the multi-thread copy path with up to 4 parts in
+flight at once, so slow sources (and slow networks) use parallel
+connections instead of crawling one part at a time.
+
 Uploads do not send a file hash when the source cannot provide one. When
 the source can give both MD5 and SHA-1 without the backend reading the
 stream (most remote backends expose them in their metadata), the backend
