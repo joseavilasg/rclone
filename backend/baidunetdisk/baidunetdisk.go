@@ -276,6 +276,13 @@ func (f *Fs) Features() *fs.Features {
 	return f.features
 }
 
+// SplitUploadProgress opts into 50/50 split transfer progress: Baidu demands
+// every slice hash before the first byte, so source reads fill the first half
+// of the bar and the reported slice uploads fill the second.
+func (f *Fs) SplitUploadProgress() bool {
+	return true
+}
+
 // Precision returns the precision of this remote
 func (f *Fs) Precision() time.Duration {
 	return fs.ModTimeNotSupported

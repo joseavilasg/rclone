@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"sync"
+	"sync/atomic"
 	"time"
 	"unicode/utf8"
 
@@ -74,6 +75,8 @@ type Account struct {
 	tokenBucket buckets // per file bandwidth limiter (may be nil)
 
 	values accountValues
+
+	split atomic.Bool // 50/50 split progress: reads and uploads each fill half
 }
 
 // accountValues holds statistics for this Account
@@ -357,7 +360,36 @@ func (acc *Account) limitPerFileBandwidth(n int) {
 // Account the read
 func (acc *Account) accountReadN(n int64) {
 	// Update Stats
+	if acc.split.Load() {
+		// Split progress: source reads fill the first half of the bar,
+		// reported destination uploads fill the second.
+		n /= 2
+	}
 	acc.values.mu.Lock()
+	acc.values.lpBytes += n
+	acc.values.bytes += n
+	acc.values.mu.Unlock()
+
+	acc.stats.Bytes(n)
+}
+
+// accountUpload credits n destination upload bytes on a split transfer,
+// filling the second half of the bar. Unlike reads it applies no bandwidth
+// limiting (the upload already happened) and never lets progress exceed the
+// transfer size (re-uploaded slices after a restart report twice).
+func (acc *Account) accountUpload(n int64) {
+	if n <= 0 {
+		return
+	}
+	n /= 2
+	acc.values.mu.Lock()
+	if size := acc.size; size > 0 && acc.values.bytes+n > size {
+		n = size - acc.values.bytes
+	}
+	if n <= 0 {
+		acc.values.mu.Unlock()
+		return
+	}
 	acc.values.lpBytes += n
 	acc.values.bytes += n
 	acc.values.mu.Unlock()

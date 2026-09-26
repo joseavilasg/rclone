@@ -107,9 +107,11 @@ first asked whether the content already exists: a hit creates the entry
 instantly and skips the transfer entirely (秒传). Uploads of content the
 server already has also skip reading the source in multi-thread copies.
 
-Because the slice hashes gate the whole upload, the progress bar only tracks
-the source reads (which finish while spooling) and stays at 100% while the
-slices upload. The upload itself is logged every 5% so it stays visible.
+Because the slice hashes gate the whole upload, this backend splits one
+transfer's progress 50/50: source reads fill the first half of the bar and
+the uploaded slices fill the second, so the bar stays alive through the
+upload instead of freezing at 100%. The upload itself is also logged every 5%
+so it stays visible.
 
 Empty files cannot be uploaded: Baidu refuses them server-side.
 

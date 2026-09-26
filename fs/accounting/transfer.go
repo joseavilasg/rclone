@@ -67,7 +67,12 @@ type Transfer struct {
 	err         error
 	completedAt time.Time
 	doneBytes   int64
+	split       bool // 50/50 split progress: reads fill the first half, reported uploads the second
 }
+
+// uploadProgressKey carries the *Transfer an upload backend reports
+// destination bytes to with AddUploadProgress.
+type uploadProgressKey struct{}
 
 // newCheckingTransfer instantiates new checking of the object.
 func newCheckingTransfer(stats *StatsInfo, obj fs.DirEntry, what string) *Transfer {
@@ -166,8 +171,51 @@ func (tr *Transfer) Account(ctx context.Context, in io.ReadCloser) *Account {
 		tr.acc.UpdateReader(ctx, in)
 	}
 	tr.acc.checking = tr.checking
+	tr.acc.split.Store(tr.split)
 	tr.mu.Unlock()
 	return tr.acc
+}
+
+// EnableSplitUpload arms 50/50 split progress when dstFs opts in with
+// fs.UploadProgressSplitter, returning a context carrying this transfer as
+// the destination-bytes reporter. Source reads then fill the first half of
+// the bar and AddUploadProgress fills the second. Transfers to any other
+// destination, and contexts without a reporter, behave exactly as before.
+func (tr *Transfer) EnableSplitUpload(ctx context.Context, dstFs fs.Fs) context.Context {
+	splitter, ok := dstFs.(fs.UploadProgressSplitter)
+	if !ok || !splitter.SplitUploadProgress() {
+		return ctx
+	}
+	tr.mu.Lock()
+	tr.split = true
+	if tr.acc != nil {
+		tr.acc.split.Store(true)
+	}
+	tr.mu.Unlock()
+	return context.WithValue(ctx, uploadProgressKey{}, tr)
+}
+
+// AddUploadProgress credits n destination upload bytes to the transfer
+// carried by ctx, filling the second half of a split transfer. It is a
+// nil-safe no-op when ctx carries no reporter (or its transfer is done),
+// so backends may call it unconditionally.
+func AddUploadProgress(ctx context.Context, n int64) {
+	tr, ok := ctx.Value(uploadProgressKey{}).(*Transfer)
+	if !ok || tr == nil || n <= 0 {
+		return
+	}
+	tr.addUploadBytes(n)
+}
+
+// addUploadBytes credits destination upload bytes on a split transfer.
+func (tr *Transfer) addUploadBytes(n int64) {
+	tr.mu.RLock()
+	acc, split := tr.acc, tr.split
+	tr.mu.RUnlock()
+	if !split || acc == nil {
+		return
+	}
+	acc.accountUpload(n)
 }
 
 // TimeRange returns the time transfer started and ended at. If not completed

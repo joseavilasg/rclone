@@ -161,6 +161,104 @@ func TestMultithreadCopyChunkWriterAlreadyExistser(t *testing.T) {
 	assert.True(t, writer.closeCalled, "the chunk writer must be closed before the lookup")
 }
 
+// splitDstFs opts a mock destination into 50/50 split upload progress.
+type splitDstFs struct {
+	fs.Fs
+}
+
+func (splitDstFs) SplitUploadProgress() bool { return true }
+
+// splitReportWriter discards every chunk and reports it as destination
+// upload progress, like a hash-then-upload backend does once its slices are
+// on the server. Close creates the entry so the fresh lookup wins.
+type splitReportWriter struct {
+	mu       sync.Mutex
+	reported int64
+	dst      fs.Fs
+	remote   string
+	content  []byte
+}
+
+func (w *splitReportWriter) WriteChunk(ctx context.Context, chunkNumber int, reader io.ReadSeeker) (int64, error) {
+	n, err := io.Copy(io.Discard, reader)
+	if err != nil {
+		return 0, err
+	}
+	accounting.AddUploadProgress(ctx, n)
+	w.mu.Lock()
+	w.reported += n
+	w.mu.Unlock()
+	return n, nil
+}
+
+func (w *splitReportWriter) Close(ctx context.Context) error {
+	w.dst.(*mockfs.Fs).AddObject(mockobject.New(w.remote).WithContent(w.content, mockobject.SeekModeNone))
+	return nil
+}
+
+func (w *splitReportWriter) Abort(ctx context.Context) error { return nil }
+
+// TestMultithreadCopySplitUploadProgress pins the 50/50 split end to end:
+// source reads fill the first half of the transfer, the writer's upload
+// reports fill the second, and the snapshot lands exactly on the file size.
+func TestMultithreadCopySplitUploadProgress(t *testing.T) {
+	ctx := context.Background()
+	data := []byte(random.String(4 * (1 << 20)))
+	srcObj := mockobject.New("file.bin").WithContent(data, mockobject.SeekModeRange)
+	srcFs, err := mockfs.NewFs(ctx, "sausage", "", nil)
+	require.NoError(t, err)
+	srcObj.SetFs(srcFs)
+
+	baseDst, err := mockfs.NewFs(ctx, "potato", "", nil)
+	require.NoError(t, err)
+	dst := splitDstFs{baseDst}
+	writer := &splitReportWriter{dst: baseDst, remote: "file.bin", content: data}
+	baseDst.Features().OpenChunkWriter = func(ctx context.Context, remote string, src fs.ObjectInfo, options ...fs.OpenOption) (fs.ChunkWriterInfo, fs.ChunkWriter, error) {
+		return fs.ChunkWriterInfo{ChunkSize: int64(1 * fs.Mebi), Concurrency: 2}, writer, nil
+	}
+
+	accounting.GlobalStats().ResetCounters()
+	tr := accounting.GlobalStats().NewTransfer(srcObj, dst)
+	splitCtx := tr.EnableSplitUpload(ctx, dst)
+	got, err := multiThreadCopy(splitCtx, dst, "file.bin", srcObj, 2, tr)
+	require.NoError(t, err)
+	require.NotNil(t, got)
+
+	snap := tr.Snapshot()
+	assert.Equal(t, int64(len(data)), snap.Bytes, "reads plus reported uploads must land exactly on the file size")
+	assert.Equal(t, int64(len(data)), writer.reported, "every source byte must be reported as an upload byte")
+	tr.Done(ctx, err)
+}
+
+// TestMultithreadCopyNoSplitCountsReads pins the default: without the
+// opt-in the transfer counts source reads fully, and stray upload reports
+// into a sink-less context change nothing.
+func TestMultithreadCopyNoSplitCountsReads(t *testing.T) {
+	ctx := context.Background()
+	data := []byte(random.String(2 * (1 << 20)))
+	srcObj := mockobject.New("file.bin").WithContent(data, mockobject.SeekModeRange)
+	srcFs, err := mockfs.NewFs(ctx, "sausage", "", nil)
+	require.NoError(t, err)
+	srcObj.SetFs(srcFs)
+
+	baseDst, err := mockfs.NewFs(ctx, "potato", "", nil)
+	require.NoError(t, err)
+	writer := &splitReportWriter{dst: baseDst, remote: "file.bin", content: data}
+	baseDst.Features().OpenChunkWriter = func(ctx context.Context, remote string, src fs.ObjectInfo, options ...fs.OpenOption) (fs.ChunkWriterInfo, fs.ChunkWriter, error) {
+		return fs.ChunkWriterInfo{ChunkSize: int64(1 * fs.Mebi), Concurrency: 1}, writer, nil
+	}
+
+	accounting.GlobalStats().ResetCounters()
+	tr := accounting.GlobalStats().NewTransfer(srcObj, baseDst)
+	got, err := multiThreadCopy(ctx, baseDst, "file.bin", srcObj, 1, tr)
+	require.NoError(t, err)
+	require.NotNil(t, got)
+
+	snap := tr.Snapshot()
+	assert.Equal(t, int64(len(data)), snap.Bytes, "reads must count fully without the opt-in")
+	tr.Done(ctx, err)
+}
+
 func TestMultithreadCalculateNumChunks(t *testing.T) {
 	for _, test := range []struct {
 		size          int64

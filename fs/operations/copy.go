@@ -390,6 +390,7 @@ func (c *copy) copy(ctx context.Context) (newDst fs.Object, err error) {
 func Copy(ctx context.Context, f fs.Fs, dst fs.Object, remote string, src fs.Object) (newDst fs.Object, err error) {
 	ci := fs.GetConfig(ctx)
 	tr := accounting.Stats(ctx).NewTransfer(src, f)
+	ctx = tr.EnableSplitUpload(ctx, f)
 	defer func() {
 		tr.Done(ctx, err)
 	}()
