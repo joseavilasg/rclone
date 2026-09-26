@@ -69,11 +69,25 @@ func (f *Fs) uploadCommit(ctx context.Context, pre api.UpPreResp, md5Sum, sha1Su
 // provide both without us having to read the stream, and ok=false otherwise.
 // quark looks the content up by md5+sha1 together, so the instant-dedupe
 // pre-check only makes sense when both are present.
+//
+// A source that implements fs.MultiHasher hands both over from a single read,
+// which halves the disk traffic of a local source; anything else is asked one
+// hash type at a time.
 func sourceHashes(ctx context.Context, src fs.ObjectInfo) (md5Sum, sha1Sum string, ok bool) {
 	if src == nil {
 		return "", "", false
 	}
 	fs.Infof(src, "quark: computing source hashes to check if the upload already exists")
+	want := fshash.NewHashSet(fshash.MD5, fshash.SHA1)
+	if mh, isMulti := src.(fs.MultiHasher); isMulti {
+		hashes, err := mh.MultiHash(ctx, want)
+		if err == nil {
+			md5Sum, sha1Sum = hashes[fshash.MD5], hashes[fshash.SHA1]
+			if md5Sum != "" && sha1Sum != "" {
+				return md5Sum, sha1Sum, true
+			}
+		}
+	}
 	md5Sum, err := src.Hash(ctx, fshash.MD5)
 	if err != nil || md5Sum == "" {
 		return "", "", false

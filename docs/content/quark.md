@@ -89,6 +89,14 @@ re-uploaded nor re-downloaded from a remote source. A miss (or a hash-less
 source) uploads as described above. rclone also avoids re-copying files
 that already exist with the same size when a validation method is in use.
 
+Computing both hashes of a local source means reading the file, and the
+backend does that in a single read: it asks the source for MD5 and SHA-1
+together when the source can serve both at once (the `fs.MultiHasher`
+interface, implemented by the local backend), and falls back to asking for
+one hash type at a time for sources that cannot. For a file that turns out
+to be deduplicated that read is the entire cost of the copy, so the single
+pass halves the wait before Quark answers.
+
 ## Downloads
 
 Downloads of large files are read as a chain of small ranged requests
