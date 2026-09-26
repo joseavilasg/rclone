@@ -140,6 +140,9 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 	f.features = (&fs.Features{
 		ReadMimeType:            true,
 		CanHaveEmptyDirectories: true,
+		// The chunk writer streams each chunk exactly once without seeking,
+		// so the core reads the source unbuffered with live progress.
+		ChunkWriterDoesntSeek: true,
 	}).Fill(ctx, f)
 
 	// Resolve the root path (anchored at the drive root) to distinguish a

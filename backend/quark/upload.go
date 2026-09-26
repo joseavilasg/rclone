@@ -138,13 +138,7 @@ func (f *Fs) uploadPartsAndCommit(ctx context.Context, remote string, pre api.Up
 	if partSize <= 0 {
 		return fmt.Errorf("quark: pre response has bad part size %d", pre.Metadata.PartSize)
 	}
-	w := &chunkWriter{
-		f:        f,
-		pre:      pre,
-		mimeType: formatType,
-		md5Sum:   md5.New(),
-		sha1Sum:  sha1.New(),
-	}
+	w := newChunkWriter(f, pre, formatType, false, numPartsFor(size, partSize))
 	if size > 0 {
 		etags, err := w.uploadParts(ctx, size, partSize, in)
 		if err != nil {
@@ -208,17 +202,60 @@ func (f *Fs) PutStream(ctx context.Context, in io.Reader, src fs.ObjectInfo, opt
 	return f.NewObject(ctx, src.Remote())
 }
 
-// chunkWriter implements fs.ChunkWriter for the multipart OSS upload
+// chunkWriter implements fs.ChunkWriter for the multipart OSS upload.
+// Downloads run in parallel (ChunkWriterInfo.Concurrency) while a pump
+// uploads finished parts strictly in chunk order: the OSS endpoint rejects
+// out-of-order part numbers, so WriteChunk only stores and the pump uploads
+// consecutive available parts.
 type chunkWriter struct {
 	f        *Fs
 	pre      api.UpPreResp
 	mimeType string
 	deduped  bool // content already exists: chunks are consumed and discarded
+	upload   func(ctx context.Context, idx int, buf []byte) (string, error)
 
 	mu      sync.Mutex
-	etags   []string
+	etags   []string // etag per part, indexed by chunkNumber
 	md5Sum  hash.Hash
 	sha1Sum hash.Hash
+	// Pump state for ordered upload over parallel downloads.
+	bufs       [][]byte   // downloaded bodies indexed by chunkNumber (nil = absent)
+	nextUpload int        // next chunk index the pump must upload
+	buffered   int        // bufs currently held
+	failErr    error      // first pump failure, returned to bound waiters
+	upMu       sync.Mutex // single-pumper: one ordered upload run at a time
+	pumpCond   *sync.Cond // wakes bound waiters on drain or failure
+}
+
+// maxBufferedParts caps downloaded-but-unuploaded chunks per file. The core
+// launches chunks in index order, so the missing head is always already
+// launched and always arrives to drain; the bound only caps pathological
+// head droughts.
+const maxBufferedParts = 8
+
+// newChunkWriter builds a writer for numParts parts, sizing the etag and
+// body tables and arming the hash turnstile.
+func newChunkWriter(f *Fs, pre api.UpPreResp, mimeType string, deduped bool, numParts int) *chunkWriter {
+	w := &chunkWriter{
+		f:        f,
+		pre:      pre,
+		mimeType: mimeType,
+		deduped:  deduped,
+		etags:    make([]string, numParts),
+		bufs:     make([][]byte, numParts),
+		md5Sum:   md5.New(),
+		sha1Sum:  sha1.New(),
+		upload: func(ctx context.Context, idx int, buf []byte) (string, error) {
+			return f.uploadPartRetry(ctx, pre, mimeType, idx+1, int64(len(buf)), bytes.NewReader(buf))
+		},
+	}
+	w.pumpCond = sync.NewCond(&w.mu)
+	return w
+}
+
+// numPartsFor sizes the etag table: how many partSize pieces cover size.
+func numPartsFor(size, partSize int64) int {
+	return int((size + partSize - 1) / partSize)
 }
 
 // AlreadyExists implements fs.ChunkWriterAlreadyExistser: when the dedupe
@@ -249,51 +286,111 @@ func (f *Fs) OpenChunkWriter(ctx context.Context, remote string, src fs.ObjectIn
 	if err != nil {
 		return fs.ChunkWriterInfo{}, nil, err
 	}
-	w := &chunkWriter{
-		f:        f,
-		pre:      pre,
-		mimeType: formatType,
-		deduped:  deduped,
-		md5Sum:   md5.New(),
-		sha1Sum:  sha1.New(),
-	}
+	w := newChunkWriter(f, pre, formatType, deduped, numPartsFor(src.Size(), partSize))
 	return fs.ChunkWriterInfo{
 		ChunkSize:   partSize,
-		Concurrency: 1,
+		Concurrency: 4,
 	}, w, nil
 }
 
-// WriteChunk writes a chunk of the object. chunkNumber starts at 0.
+// readChunkFull consumes one chunk strictly forward in a single pass with
+// no seeks, so the core may hand a live network stream instead of a
+// seekable pool buffer (ChunkWriterDoesntSeek).
+func readChunkFull(reader io.Reader) ([]byte, error) {
+	buf, err := io.ReadAll(reader)
+	if err != nil {
+		return nil, fmt.Errorf("quark: read chunk: %w", err)
+	}
+	return buf, nil
+}
+
+// WriteChunk downloads one chunk of the object. chunkNumber starts at 0. The
+// reader is consumed strictly forward in a single pass (no seeks), which is
+// what lets the core stream the source unbuffered with live progress. The
+// bytes are stored for the ordered pump, which uploads parts sequentially;
+// WriteChunk only blocks past maxBufferedParts.
 func (w *chunkWriter) WriteChunk(ctx context.Context, chunkNumber int, reader io.ReadSeeker) (int64, error) {
 	if w.deduped {
 		// the entry already exists; consume the chunk so the core's accounting
 		// and read loop keep working, but never upload a part.
 		return io.Copy(io.Discard, reader)
 	}
-	n, err := reader.Seek(0, io.SeekEnd)
+	buf, err := readChunkFull(reader)
 	if err != nil {
 		return 0, err
 	}
-	if n == 0 {
+	if len(buf) == 0 {
 		return 0, nil
 	}
-	if _, err := reader.Seek(0, io.SeekStart); err != nil {
+	n := int64(len(buf))
+	if err := w.stageAndPump(ctx, chunkNumber, buf); err != nil {
 		return 0, err
 	}
-	buf := make([]byte, n)
-	if _, err := io.ReadFull(reader, buf); err != nil {
-		return 0, fmt.Errorf("quark: read chunk: %w", err)
+	return n, nil
+}
+
+// stageAndPump stores a downloaded chunk and runs the ordered pump, blocking
+// past maxBufferedParts until earlier parts drain.
+func (w *chunkWriter) stageAndPump(ctx context.Context, chunkNumber int, buf []byte) error {
+	w.mu.Lock()
+	if w.failErr != nil {
+		err := w.failErr
+		w.mu.Unlock()
+		return err
 	}
-	_, _ = w.md5Sum.Write(buf)
-	_, _ = w.sha1Sum.Write(buf)
-	etag, err := w.f.uploadPartRetry(ctx, w.pre, w.mimeType, chunkNumber+1, n, bytes.NewReader(buf))
+	w.bufs[chunkNumber] = buf
+	w.buffered++
+	w.mu.Unlock()
+	w.upMu.Lock()
+	err := w.pump(ctx)
+	w.upMu.Unlock()
 	if err != nil {
-		return 0, err
+		return err
 	}
 	w.mu.Lock()
-	w.etags = append(w.etags, etag)
-	w.mu.Unlock()
-	return n, nil
+	defer w.mu.Unlock()
+	for w.buffered > maxBufferedParts && w.failErr == nil {
+		w.pumpCond.Wait()
+	}
+	return w.failErr
+}
+
+// pump uploads every consecutive available part in chunk order. Only one
+// pump runs at a time; arrivals that find no consecutive part return at once.
+func (w *chunkWriter) pump(ctx context.Context) error {
+	for {
+		w.mu.Lock()
+		if w.failErr != nil {
+			err := w.failErr
+			w.mu.Unlock()
+			return err
+		}
+		if w.nextUpload >= len(w.bufs) || w.bufs[w.nextUpload] == nil {
+			w.mu.Unlock()
+			return nil
+		}
+		idx := w.nextUpload
+		buf := w.bufs[idx]
+		w.mu.Unlock()
+		etag, err := w.upload(ctx, idx, buf)
+		w.mu.Lock()
+		if err != nil {
+			if w.failErr == nil {
+				w.failErr = err
+			}
+			w.pumpCond.Broadcast()
+			w.mu.Unlock()
+			return err
+		}
+		w.bufs[idx] = nil
+		_, _ = w.md5Sum.Write(buf)
+		_, _ = w.sha1Sum.Write(buf)
+		w.etags[idx] = etag
+		w.nextUpload++
+		w.buffered--
+		w.pumpCond.Broadcast()
+		w.mu.Unlock()
+	}
 }
 
 // uploadParts streams size bytes from in in partSize chunks, hashing each part
@@ -323,7 +420,7 @@ func (w *chunkWriter) uploadParts(ctx context.Context, size, partSize int64, in 
 			return nil, err
 		}
 		w.mu.Lock()
-		w.etags = append(w.etags, etag)
+		w.etags[part-1] = etag
 		w.mu.Unlock()
 		remaining -= int64(n)
 		part++

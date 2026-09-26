@@ -3,6 +3,7 @@ package quark
 import (
 	"bytes"
 	"context"
+	"crypto/md5"
 	"fmt"
 	"io"
 	"net/http"
@@ -456,4 +457,139 @@ func TestOpenChunkWriterPrecheckMiss(t *testing.T) {
 	require.NoError(t, err)
 	assert.False(t, w2.(*chunkWriter).deduped)
 	assert.Equal(t, 0, noHashCount, "a hash-less source must skip the pre-check entirely")
+}
+
+// seekHostileReader fails any Seek: readChunkFull must consume a chunk in one
+// forward pass so the core may stream live network readers unbuffered.
+type seekHostileReader struct {
+	io.Reader
+	seeks int
+}
+
+func (r *seekHostileReader) Seek(offset int64, whence int) (int64, error) {
+	r.seeks++
+	return 0, fmt.Errorf("seek not supported")
+}
+
+// TestReadChunkFullNoSeek pins the ChunkWriterDoesntSeek contract: a full
+// chunk is consumed without a single seek.
+func TestReadChunkFullNoSeek(t *testing.T) {
+	data := []byte("chunk-data-12345")
+	r := &seekHostileReader{Reader: bytes.NewReader(data)}
+	buf, err := readChunkFull(r)
+	require.NoError(t, err)
+	assert.Equal(t, data, buf)
+	assert.Equal(t, 0, r.seeks, "chunk reads must never seek")
+}
+
+// TestPumpUploadsInOrder pins the ordered-pump contract: parts staged out of
+// order upload strictly ascending, hash exactly like a sequential pass and
+// land etags by position, so the commit matches a single-stream upload.
+func TestPumpUploadsInOrder(t *testing.T) {
+	const parts = 4
+	chunks := make([][]byte, parts)
+	var sequential []byte
+	for i := range chunks {
+		chunks[i] = []byte(fmt.Sprintf("part-%d-payload-", i) + strings.Repeat("x", 1000+i))
+		sequential = append(sequential, chunks[i]...)
+	}
+	wantMD5 := md5.Sum(sequential)
+
+	w := newChunkWriter(nil, api.UpPreResp{}, "", false, parts)
+	var mu sync.Mutex
+	var order []int
+	w.upload = func(ctx context.Context, idx int, buf []byte) (string, error) {
+		mu.Lock()
+		order = append(order, idx)
+		mu.Unlock()
+		assert.Equal(t, chunks[idx], buf)
+		return fmt.Sprintf("etag-%d", idx), nil
+	}
+	ctx := context.Background()
+	var wg sync.WaitGroup
+	// Stage in reverse from goroutines; uploads must still run 0,1,2,3.
+	for i := parts - 1; i >= 0; i-- {
+		wg.Add(1)
+		go func(idx int) {
+			defer wg.Done()
+			require.NoError(t, w.stageAndPump(ctx, idx, chunks[idx]))
+		}(i)
+	}
+	wg.Wait()
+
+	assert.Equal(t, []int{0, 1, 2, 3}, order, "parts must upload in chunk order")
+	assert.Equal(t, wantMD5[:], w.md5Sum.Sum(nil), "pumped parts must hash like a sequential pass")
+	for i := 0; i < parts; i++ {
+		assert.Equal(t, fmt.Sprintf("etag-%d", i), w.etags[i], "etags must land by chunk position")
+	}
+	assert.Equal(t, 0, w.buffered)
+	assert.Equal(t, parts, w.nextUpload)
+}
+
+// TestPumpBoundDrains pins the memory bound: past maxBufferedParts a stage
+// blocks until the missing head arrives and drains.
+func TestPumpBoundDrains(t *testing.T) {
+	const parts = 10
+	w := newChunkWriter(nil, api.UpPreResp{}, "", false, parts)
+	var mu sync.Mutex
+	var order []int
+	w.upload = func(ctx context.Context, idx int, buf []byte) (string, error) {
+		mu.Lock()
+		order = append(order, idx)
+		mu.Unlock()
+		return fmt.Sprintf("etag-%d", idx), nil
+	}
+	ctx := context.Background()
+	payload := func(i int) []byte { return fmt.Appendf(nil, "p%d", i) }
+	// Stage 1..8 without the head: buffered but nothing uploads.
+	for i := 1; i <= 8; i++ {
+		require.NoError(t, w.stageAndPump(ctx, i, payload(i)))
+	}
+	// The 9th stage must block past the bound until the head drains.
+	blocked := make(chan error, 1)
+	go func() { blocked <- w.stageAndPump(ctx, 9, payload(9)) }()
+	select {
+	case err := <-blocked:
+		t.Fatalf("stage past the bound returned early: %v", err)
+	case <-time.After(200 * time.Millisecond):
+	}
+	// The head arrives and drains everything in order.
+	require.NoError(t, w.stageAndPump(ctx, 0, payload(0)))
+	select {
+	case err := <-blocked:
+		require.NoError(t, err)
+	case <-time.After(10 * time.Second):
+		t.Fatal("bound waiter never woke after the head drained")
+	}
+	assert.Equal(t, []int{0, 1, 2, 3, 4, 5, 6, 7, 8, 9}, order)
+	assert.Equal(t, 0, w.buffered)
+}
+
+// TestPumpFailureWakes pins failure liveness: a failed part wakes bound
+// waiters with an error instead of hanging them.
+func TestPumpFailureWakes(t *testing.T) {
+	const parts = 10
+	w := newChunkWriter(nil, api.UpPreResp{}, "", false, parts)
+	w.upload = func(ctx context.Context, idx int, buf []byte) (string, error) {
+		if idx == 0 {
+			return "", fmt.Errorf("boom")
+		}
+		return fmt.Sprintf("etag-%d", idx), nil
+	}
+	ctx := context.Background()
+	payload := func(i int) []byte { return fmt.Appendf(nil, "p%d", i) }
+	for i := 1; i <= 8; i++ {
+		require.NoError(t, w.stageAndPump(ctx, i, payload(i)))
+	}
+	blocked := make(chan error, 1)
+	go func() { blocked <- w.stageAndPump(ctx, 9, payload(9)) }()
+	// The head fails: both its own stage and the bound waiter must error out.
+	err := w.stageAndPump(ctx, 0, payload(0))
+	require.Error(t, err)
+	select {
+	case err := <-blocked:
+		require.Error(t, err, "a bound waiter must wake with the pump failure")
+	case <-time.After(10 * time.Second):
+		t.Fatal("bound waiter hung on a failed pump")
+	}
 }

@@ -259,6 +259,91 @@ func TestMultithreadCopyNoSplitCountsReads(t *testing.T) {
 	tr.Done(ctx, err)
 }
 
+// dripWriter blocks mid-chunk so the test can observe live progress: it
+// reads one byte, signals started, waits for release, then consumes the rest.
+type dripWriter struct {
+	dst       fs.Fs
+	remote    string
+	content   []byte
+	started   chan struct{}
+	release   chan struct{}
+	startOnce sync.Once
+}
+
+func (w *dripWriter) WriteChunk(ctx context.Context, chunkNumber int, reader io.ReadSeeker) (int64, error) {
+	if _, err := reader.Read(make([]byte, 1)); err != nil {
+		return 0, err
+	}
+	w.startOnce.Do(func() { close(w.started) })
+	<-w.release
+	n, err := io.Copy(io.Discard, reader)
+	return n + 1, err
+}
+
+func (w *dripWriter) Close(ctx context.Context) error {
+	w.dst.(*mockfs.Fs).AddObject(mockobject.New(w.remote).WithContent(w.content, mockobject.SeekModeNone))
+	return nil
+}
+
+func (w *dripWriter) Abort(ctx context.Context) error { return nil }
+
+// TestMultithreadCopyLiveProgressWithoutBuffering pins that a destination
+// with ChunkWriterDoesntSeek counts source bytes as they stream in: with the
+// first chunk held open mid-flight the snapshot must already show partial
+// bytes, not a silent zero.
+func TestMultithreadCopyLiveProgressWithoutBuffering(t *testing.T) {
+	ctx := context.Background()
+	data := []byte(random.String(2 * (1 << 20)))
+	// SeekModeNone slices the range like a real backend: the Range modes
+	// hand back the whole content unbounded, which would over-read.
+	srcObj := mockobject.New("file.bin").WithContent(data, mockobject.SeekModeNone)
+	srcFs, err := mockfs.NewFs(ctx, "sausage", "", nil)
+	require.NoError(t, err)
+	srcObj.SetFs(srcFs)
+
+	baseDst, err := mockfs.NewFs(ctx, "potato", "", nil)
+	require.NoError(t, err)
+	baseDst.Features().ChunkWriterDoesntSeek = true
+	writer := &dripWriter{
+		dst:     baseDst,
+		remote:  "file.bin",
+		content: data,
+		started: make(chan struct{}),
+		release: make(chan struct{}),
+	}
+	baseDst.Features().OpenChunkWriter = func(ctx context.Context, remote string, src fs.ObjectInfo, options ...fs.OpenOption) (fs.ChunkWriterInfo, fs.ChunkWriter, error) {
+		return fs.ChunkWriterInfo{ChunkSize: int64(1 * fs.Mebi), Concurrency: 1}, writer, nil
+	}
+
+	accounting.GlobalStats().ResetCounters()
+	tr := accounting.GlobalStats().NewTransfer(srcObj, baseDst)
+	done := make(chan error, 1)
+	go func() {
+		_, err := multiThreadCopy(ctx, baseDst, "file.bin", srcObj, 1, tr)
+		done <- err
+	}()
+
+	select {
+	case <-writer.started:
+	case <-time.After(30 * time.Second):
+		t.Fatal("first chunk never started reading")
+	}
+	snap := tr.Snapshot()
+	assert.Greater(t, snap.Bytes, int64(0), "bytes must count while the first chunk streams in")
+	assert.Less(t, snap.Bytes, int64(len(data)), "the first chunk must still be in flight")
+	close(writer.release)
+
+	select {
+	case err := <-done:
+		require.NoError(t, err)
+	case <-time.After(60 * time.Second):
+		t.Fatal("copy never finished after release")
+	}
+	snap = tr.Snapshot()
+	assert.Equal(t, int64(len(data)), snap.Bytes)
+	tr.Done(ctx, nil)
+}
+
 func TestMultithreadCalculateNumChunks(t *testing.T) {
 	for _, test := range []struct {
 		size          int64
