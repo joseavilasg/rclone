@@ -3,6 +3,8 @@ package local
 import (
 	"bytes"
 	"context"
+	"crypto/md5"
+	"crypto/sha1"
 	"fmt"
 	"io"
 	"math"
@@ -1131,4 +1133,144 @@ func TestCopySymlink(t *testing.T) {
 	require.NotNil(t, dst)
 	want = fstest.NewItem("dst2/file.txt", "hello world", when)
 	fstest.CompareItems(t, []fs.DirEntry{dst}, []fstest.Item{want}, nil, f.precision, "")
+}
+
+// TestObjectMultiHashOneRead pins that MultiHash derives every requested hash
+// from a single read of the file and caches them. After the call the file is
+// overwritten with different bytes of the same size and its mtime restored, so
+// any later Hash that re-read the content would return the new hash. Getting
+// the original values back proves the cache answered without a read.
+func TestObjectMultiHashOneRead(t *testing.T) {
+	r := fstest.NewRun(t)
+	const filePath = "multihash object"
+	const content = "abcdefghij"
+	mtime := time.Unix(1700000000, 0)
+	r.WriteFile(filePath, content, mtime)
+
+	f := r.Flocal.(*Fs)
+	realPath := filepath.Join(f.root, filePath)
+	require.NoError(t, os.Chtimes(realPath, mtime, mtime))
+
+	ctx := context.Background()
+	o, err := r.Flocal.NewObject(ctx, filePath)
+	require.NoError(t, err)
+
+	got, err := o.(*Object).MultiHash(ctx, hash.NewHashSet(hash.MD5, hash.SHA1))
+	require.NoError(t, err)
+
+	// Oracle is the stdlib, not the primitive the implementation uses.
+	sumMD5 := md5.Sum([]byte(content))
+	sumSHA1 := sha1.Sum([]byte(content))
+	assert.Equal(t, fmt.Sprintf("%x", sumMD5), got[hash.MD5], "MD5 must match the stdlib")
+	assert.Equal(t, fmt.Sprintf("%x", sumSHA1), got[hash.SHA1], "SHA1 must match the stdlib")
+
+	// Same size, different bytes, mtime put back: a re-read sees these.
+	require.NoError(t, os.WriteFile(realPath, []byte("0123456789"), 0600))
+	require.NoError(t, os.Chtimes(realPath, mtime, mtime))
+
+	md5Value, err := o.Hash(ctx, hash.MD5)
+	require.NoError(t, err)
+	assert.Equal(t, got[hash.MD5], md5Value, "Hash must serve the cached MD5, not re-read the file")
+	sha1Value, err := o.Hash(ctx, hash.SHA1)
+	require.NoError(t, err)
+	assert.Equal(t, got[hash.SHA1], sha1Value, "Hash must serve the cached SHA1, not re-read the file")
+
+	// A second MultiHash over the same set is served entirely from the cache.
+	again, err := o.(*Object).MultiHash(ctx, hash.NewHashSet(hash.MD5, hash.SHA1))
+	require.NoError(t, err)
+	assert.Equal(t, got, again)
+}
+
+// TestObjectMultiHashSubset pins the subset contract: when this Fs serves only
+// part of the requested set, MultiHash returns what it can rather than
+// failing, and the caller detects the gap from the missing key. It restores
+// the shared Fs option so it cannot leak into other tests.
+func TestObjectMultiHashSubset(t *testing.T) {
+	r := fstest.NewRun(t)
+	const filePath = "multihash subset"
+	const content = "abcdefghij"
+	mtime := time.Unix(1700000000, 0)
+	r.WriteFile(filePath, content, mtime)
+
+	f := r.Flocal.(*Fs)
+	realPath := filepath.Join(f.root, filePath)
+	require.NoError(t, os.Chtimes(realPath, mtime, mtime))
+	original := f.opt.Hashes
+	f.opt.Hashes = fs.CommaSepList{"md5"}
+	defer func() { f.opt.Hashes = original }()
+
+	ctx := context.Background()
+	o, err := r.Flocal.NewObject(ctx, filePath)
+	require.NoError(t, err)
+
+	got, err := o.(*Object).MultiHash(ctx, hash.NewHashSet(hash.MD5, hash.SHA1))
+	require.NoError(t, err, "a partly supported set must not fail")
+
+	sumMD5 := md5.Sum([]byte(content))
+	assert.Equal(t, fmt.Sprintf("%x", sumMD5), got[hash.MD5], "the supported type must be returned")
+	assert.NotContains(t, got, hash.SHA1, "an unsupported type must be absent, not empty")
+}
+
+// TestObjectMultiHashNoneSupported pins that a set this Fs cannot serve at all
+// reports hash.ErrUnsupported so the caller drops back to Object.Hash.
+func TestObjectMultiHashNoneSupported(t *testing.T) {
+	r := fstest.NewRun(t)
+	const filePath = "multihash none"
+	r.WriteFile(filePath, "content", time.Unix(1700000000, 0))
+
+	f := r.Flocal.(*Fs)
+	original := f.opt.Hashes
+	f.opt.Hashes = fs.CommaSepList{"crc32"}
+	defer func() { f.opt.Hashes = original }()
+
+	ctx := context.Background()
+	o, err := r.Flocal.NewObject(ctx, filePath)
+	require.NoError(t, err)
+
+	_, err = o.(*Object).MultiHash(ctx, hash.NewHashSet(hash.MD5, hash.SHA1))
+	assert.ErrorIs(t, err, hash.ErrUnsupported, "a wholly unsupported set must be unsupported")
+}
+
+// TestObjectMultiHashEmptySet pins that asking for nothing is a caller error
+// rather than a silent empty result.
+func TestObjectMultiHashEmptySet(t *testing.T) {
+	r := fstest.NewRun(t)
+	const filePath = "multihash empty"
+	r.WriteFile(filePath, "content", time.Unix(1700000000, 0))
+
+	ctx := context.Background()
+	o, err := r.Flocal.NewObject(ctx, filePath)
+	require.NoError(t, err)
+
+	_, err = o.(*Object).MultiHash(ctx, hash.NewHashSet())
+	assert.Error(t, err, "an empty hash set must be rejected")
+}
+
+// TestObjectMultiHashPartialCache pins that MultiHash computes only the types
+// it is missing, so an earlier single-type hash is reused.
+func TestObjectMultiHashPartialCache(t *testing.T) {
+	r := fstest.NewRun(t)
+	const filePath = "multihash partial"
+	const content = "abcdefghij"
+	mtime := time.Unix(1700000000, 0)
+	r.WriteFile(filePath, content, mtime)
+
+	f := r.Flocal.(*Fs)
+	realPath := filepath.Join(f.root, filePath)
+	require.NoError(t, os.Chtimes(realPath, mtime, mtime))
+
+	ctx := context.Background()
+	o, err := r.Flocal.NewObject(ctx, filePath)
+	require.NoError(t, err)
+
+	// Hash MD5 alone first, so it is already cached.
+	md5Value, err := o.Hash(ctx, hash.MD5)
+	require.NoError(t, err)
+
+	got, err := o.(*Object).MultiHash(ctx, hash.NewHashSet(hash.MD5, hash.SHA1))
+	require.NoError(t, err)
+	assert.Equal(t, md5Value, got[hash.MD5], "the already cached MD5 must be reused")
+
+	sumSHA1 := sha1.Sum([]byte(content))
+	assert.Equal(t, fmt.Sprintf("%x", sumSHA1), got[hash.SHA1], "the missing SHA1 must be computed")
 }

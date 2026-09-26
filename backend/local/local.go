@@ -1228,73 +1228,126 @@ func (o *Object) Remote() string {
 	return o.remote
 }
 
-// Hash returns the requested hash of a file as a lowercase hex string
-func (o *Object) Hash(ctx context.Context, r hash.Type) (string, error) {
-	if r == hash.None {
-		return "", nil
-	}
-
-	// Check that the underlying file hasn't changed
+// hashStale reports whether the file changed since the metadata was read,
+// which invalidates any hashes accumulated for it.
+func (o *Object) hashStale() (bool, error) {
 	o.fs.objectMetaMu.RLock()
 	oldtime := o.modTime
 	oldsize := o.size
 	o.fs.objectMetaMu.RUnlock()
 	err := o.lstat()
-	var changed bool
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
 			// If file not found then we assume any accumulated
 			// hashes are OK - this will error on Open
-			changed = true
-		} else {
-			return "", fmt.Errorf("hash: failed to stat: %w", err)
+			return true, nil
+		}
+		return false, fmt.Errorf("hash: failed to stat: %w", err)
+	}
+	o.fs.objectMetaMu.RLock()
+	defer o.fs.objectMetaMu.RUnlock()
+	return !o.modTime.Equal(oldtime) || oldsize != o.size, nil
+}
+
+// streamHashes reads the object once and returns every hash in set, caching
+// the results so a later Hash call for any of those types needs no read.
+func (o *Object) streamHashes(ctx context.Context, set hash.Set) (map[hash.Type]string, error) {
+	var in io.ReadCloser
+	var err error
+	if !o.translatedLink {
+		var fd *os.File
+		fd, err = file.Open(o.path)
+		if fd != nil {
+			in = fd
 		}
 	} else {
-		o.fs.objectMetaMu.RLock()
-		changed = !o.modTime.Equal(oldtime) || oldsize != o.size
-		o.fs.objectMetaMu.RUnlock()
+		in, err = o.openTranslatedLink(0, -1)
 	}
+	if err != nil {
+		return nil, fmt.Errorf("hash: failed to open: %w", err)
+	}
+	// If not checking for updates, only read size given
+	if o.fs.opt.NoCheckUpdated {
+		in = readers.NewLimitedReadCloser(in, o.size)
+	}
+	hashes, err := hash.StreamTypes(readers.NewContextReader(ctx, in), set)
+	closeErr := in.Close()
+	if err != nil {
+		return nil, fmt.Errorf("hash: failed to read: %w", err)
+	}
+	if closeErr != nil {
+		return nil, fmt.Errorf("hash: failed to close: %w", closeErr)
+	}
+	o.fs.objectMetaMu.Lock()
+	if o.hashes == nil {
+		o.hashes = hashes
+	} else {
+		for ht, value := range hashes {
+			o.hashes[ht] = value
+		}
+	}
+	o.fs.objectMetaMu.Unlock()
+	return hashes, nil
+}
 
+// MultiHash returns the requested hashes in a single read of the file, using
+// the cache for any type already computed. It implements fs.MultiHasher.
+func (o *Object) MultiHash(ctx context.Context, set hash.Set) (map[hash.Type]string, error) {
+	if set.Count() == 0 {
+		return nil, errors.New("hash: no hash types requested")
+	}
+	want := set.Overlap(o.fs.Hashes())
+	if want.Count() == 0 {
+		return nil, hash.ErrUnsupported
+	}
+	stale, err := o.hashStale()
+	if err != nil {
+		return nil, err
+	}
+	out := make(map[hash.Type]string, want.Count())
+	missing := hash.NewHashSet()
+	o.fs.objectMetaMu.RLock()
+	for _, ht := range want.Array() {
+		if !stale {
+			if value, ok := o.hashes[ht]; ok {
+				out[ht] = value
+				continue
+			}
+		}
+		missing.Add(ht)
+	}
+	o.fs.objectMetaMu.RUnlock()
+	if missing.Count() == 0 {
+		return out, nil
+	}
+	fresh, err := o.streamHashes(ctx, missing)
+	if err != nil {
+		return nil, err
+	}
+	for ht, value := range fresh {
+		out[ht] = value
+	}
+	return out, nil
+}
+
+// Hash returns the requested hash of a file as a lowercase hex string
+func (o *Object) Hash(ctx context.Context, r hash.Type) (string, error) {
+	if r == hash.None {
+		return "", nil
+	}
+	stale, err := o.hashStale()
+	if err != nil {
+		return "", err
+	}
 	o.fs.objectMetaMu.RLock()
 	hashValue, hashFound := o.hashes[r]
 	o.fs.objectMetaMu.RUnlock()
-
-	if changed || !hashFound {
-		var in io.ReadCloser
-
-		if !o.translatedLink {
-			var fd *os.File
-			fd, err = file.Open(o.path)
-			if fd != nil {
-				in = fd
-			}
-		} else {
-			in, err = o.openTranslatedLink(0, -1)
-		}
-		// If not checking for updates, only read size given
-		if o.fs.opt.NoCheckUpdated {
-			in = readers.NewLimitedReadCloser(in, o.size)
-		}
+	if stale || !hashFound {
+		hashes, err := o.streamHashes(ctx, hash.NewHashSet(r))
 		if err != nil {
-			return "", fmt.Errorf("hash: failed to open: %w", err)
-		}
-		var hashes map[hash.Type]string
-		hashes, err = hash.StreamTypes(readers.NewContextReader(ctx, in), hash.NewHashSet(r))
-		closeErr := in.Close()
-		if err != nil {
-			return "", fmt.Errorf("hash: failed to read: %w", err)
-		}
-		if closeErr != nil {
-			return "", fmt.Errorf("hash: failed to close: %w", closeErr)
+			return "", err
 		}
 		hashValue = hashes[r]
-		o.fs.objectMetaMu.Lock()
-		if o.hashes == nil {
-			o.hashes = hashes
-		} else {
-			o.hashes[r] = hashValue
-		}
-		o.fs.objectMetaMu.Unlock()
 	}
 	return hashValue, nil
 }

@@ -8,6 +8,8 @@ import (
 	"reflect"
 	"strings"
 	"time"
+
+	"github.com/rclone/rclone/fs/hash"
 )
 
 // Features describe the optional features of the Fs
@@ -791,6 +793,24 @@ type UploadProgressSplitter interface {
 	// SplitUploadProgress reports whether this Fs splits transfer progress
 	// between source reads and reported destination upload bytes.
 	SplitUploadProgress() bool
+}
+
+// MultiHasher is an optional interface for an object source that can produce
+// several hashes from a single read of the content.
+//
+// Object.Hash serves one hash type per call, so a caller that needs MD5 and
+// SHA1 reads the object twice. On a local source that doubles the disk reads
+// for a whole-file hash, which dominates the time of a dedupe pre-check.
+// An implementation reads once, derives every requested hash from the same
+// bytes and caches the results so later Object.Hash calls for those types
+// return without reading again.
+type MultiHasher interface {
+	// MultiHash returns the hashes in set that this object supports, in one
+	// read of its content. A set it only partly supports yields the
+	// supported subset with no error, so the caller spots the gap from the
+	// missing key; it returns hash.ErrUnsupported only when the object
+	// serves none of set, and the caller then falls back to Object.Hash.
+	MultiHash(ctx context.Context, set hash.Set) (map[hash.Type]string, error)
 }
 
 // UserInfoer is an optional interface for Fs
