@@ -593,3 +593,100 @@ func TestPumpFailureWakes(t *testing.T) {
 		t.Fatal("bound waiter hung on a failed pump")
 	}
 }
+
+// countingSrc counts the per-type Hash calls the pre-check makes on it.
+type countingSrc struct {
+	fs.ObjectInfo
+	mu    sync.Mutex
+	hashN int
+}
+
+func (s *countingSrc) Hash(ctx context.Context, ty fshash.Type) (string, error) {
+	s.mu.Lock()
+	s.hashN++
+	s.mu.Unlock()
+	return s.ObjectInfo.Hash(ctx, ty)
+}
+
+func (s *countingSrc) hashesAsked() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.hashN
+}
+
+// multiHashSrc serves both hashes from a single MultiHash call, the way a
+// local source does after one read of the file.
+type multiHashSrc struct {
+	countingSrc
+	multiN   int
+	multiSet fshash.Set
+}
+
+func (s *multiHashSrc) MultiHash(ctx context.Context, set fshash.Set) (map[fshash.Type]string, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.multiN++
+	s.multiSet = set
+	return map[fshash.Type]string{
+		fshash.MD5:  "bf13fc19e5151ac57d4252e0e0f87abe",
+		fshash.SHA1: "3ab6543c08a75f292a5ecedac87ec41642d12166",
+	}, nil
+}
+
+const (
+	wantMD5  = "bf13fc19e5151ac57d4252e0e0f87abe"
+	wantSHA1 = "3ab6543c08a75f292a5ecedac87ec41642d12166"
+)
+
+// TestSourceHashesPrefersMultiHash pins that a fs.MultiHasher source is asked
+// for both hashes in one call, sparing the source a second read of the content.
+func TestSourceHashesPrefersMultiHash(t *testing.T) {
+	src := &multiHashSrc{countingSrc: countingSrc{ObjectInfo: dupSrc()}}
+
+	md5Sum, sha1Sum, ok := sourceHashes(context.Background(), src)
+	assert.True(t, ok, "both hashes were available")
+	assert.Equal(t, wantMD5, md5Sum)
+	assert.Equal(t, wantSHA1, sha1Sum)
+	assert.Equal(t, 1, src.multiN, "the source must be asked once through MultiHash")
+	assert.Equal(t, 0, src.hashesAsked(), "MultiHash must spare the per-type Hash calls")
+	assert.True(t, src.multiSet.Contains(fshash.MD5) && src.multiSet.Contains(fshash.SHA1),
+		"the pre-check must ask for both types in the same call")
+}
+
+// TestSourceHashesFallsBackWithoutMultiHash pins the fallback for a source that
+// does not implement the interface: it is asked one type at a time.
+func TestSourceHashesFallsBackWithoutMultiHash(t *testing.T) {
+	src := &countingSrc{ObjectInfo: dupSrc()}
+
+	md5Sum, sha1Sum, ok := sourceHashes(context.Background(), src)
+	assert.True(t, ok, "both hashes were available")
+	assert.Equal(t, wantMD5, md5Sum)
+	assert.Equal(t, wantSHA1, sha1Sum)
+	assert.Equal(t, 2, src.hashesAsked(), "a plain source is asked once per type")
+}
+
+// partialMultiHashSrc serves only MD5 from MultiHash, like a local Fs
+// configured with --local-hashes md5.
+type partialMultiHashSrc struct {
+	countingSrc
+	multiN int
+}
+
+func (s *partialMultiHashSrc) MultiHash(ctx context.Context, set fshash.Set) (map[fshash.Type]string, error) {
+	s.multiN++
+	return map[fshash.Type]string{fshash.MD5: wantMD5}, nil
+}
+
+// TestSourceHashesPartialMultiHashFallsBack pins that a source which serves
+// only part of the requested set is completed with per-type Hash calls rather
+// than being taken as a hit with a missing digest.
+func TestSourceHashesPartialMultiHashFallsBack(t *testing.T) {
+	src := &partialMultiHashSrc{countingSrc: countingSrc{ObjectInfo: dupSrc()}}
+
+	md5Sum, sha1Sum, ok := sourceHashes(context.Background(), src)
+	assert.True(t, ok, "the fallback must still produce both hashes")
+	assert.Equal(t, wantMD5, md5Sum)
+	assert.Equal(t, wantSHA1, sha1Sum)
+	assert.Equal(t, 1, src.multiN, "MultiHash is tried once")
+	assert.Equal(t, 2, src.hashesAsked(), "the missing digests are fetched per type")
+}
