@@ -16,6 +16,7 @@ import (
 
 	"github.com/rclone/rclone/fs"
 	"github.com/rclone/rclone/lib/pacer"
+	"golang.org/x/sync/singleflight"
 )
 
 const (
@@ -40,6 +41,12 @@ const uploadLocateAPI = "https://d.pcs.baidu.com"
 // but are cached conservatively. Keeping one URL per file lets the many ranged
 // GETs of a multi-threaded copy share a single signature.
 const downloadURLTTL = 50 * time.Minute
+
+// maxSpanTruncations is how many consecutive truncated spans a cached
+// download URL survives before it is dropped as burned and resolved fresh.
+// A single short body can be network weather; three in a row on the same URL
+// means the signature is being killed.
+const maxSpanTruncations = 3
 
 // downloadURLEntry is a resolved download URL with its expiry.
 type downloadURLEntry struct {
@@ -101,6 +108,13 @@ type Client struct {
 
 	dlMu   sync.Mutex
 	dlURLs map[string]downloadURLEntry // fs_id -> resolved download URL
+	// dlFails counts consecutive truncated spans per fs_id. At
+	// maxSpanTruncations the URL is dropped as burned and resolved fresh.
+	dlFails map[string]int
+	// dlFlight collapses concurrent resolutions for one file into a single
+	// signature: the chunks of a multi-thread copy start together and must
+	// not pay one filemetas call each.
+	dlFlight singleflight.Group
 
 	vipOnce sync.Once
 	vipType int
@@ -414,27 +428,47 @@ func (c *Client) GetFiles(ctx context.Context, dir string) ([]File, error) {
 
 // DownloadURL returns a download URL for a file, reusing any still-valid
 // cached URL so the many ranged GETs rclone issues for one object share a
-// single signature. The URL is resolved through the configured download API.
+// single signature. Concurrent resolutions for one file collapse into a
+// single flight. The URL is resolved through the configured download API.
 func (c *Client) DownloadURL(ctx context.Context, f File) (string, error) {
 	key := f.ID()
 	c.dlMu.Lock()
 	if e, ok := c.dlURLs[key]; ok && time.Now().Before(e.expires) {
 		url := e.url
 		c.dlMu.Unlock()
+		fs.Debugf(nil, "baidunetdisk: reusing cached download URL for %q", f.Path)
 		return url, nil
 	}
 	c.dlMu.Unlock()
-	url, err := c.resolveDownloadURL(ctx, f)
+	v, err, _ := c.dlFlight.Do(key, func() (any, error) {
+		// Re-check under the shared flight: a sibling may have resolved
+		// while this call queued.
+		c.dlMu.Lock()
+		if e, ok := c.dlURLs[key]; ok && time.Now().Before(e.expires) {
+			url := e.url
+			c.dlMu.Unlock()
+			return url, nil
+		}
+		c.dlMu.Unlock()
+		// Logged inside the flight so the line counts real signatures, not
+		// callers queueing on the same file.
+		fs.Debugf(nil, "baidunetdisk: resolving fresh download URL for %q via %s", f.Path, c.config.DownloadAPI)
+		url, err := c.resolveDownloadURL(ctx, f)
+		if err != nil {
+			return "", err
+		}
+		c.dlMu.Lock()
+		if c.dlURLs == nil {
+			c.dlURLs = map[string]downloadURLEntry{}
+		}
+		c.dlURLs[key] = downloadURLEntry{url: url, expires: time.Now().Add(downloadURLTTL)}
+		c.dlMu.Unlock()
+		return url, nil
+	})
 	if err != nil {
 		return "", err
 	}
-	c.dlMu.Lock()
-	if c.dlURLs == nil {
-		c.dlURLs = map[string]downloadURLEntry{}
-	}
-	c.dlURLs[key] = downloadURLEntry{url: url, expires: time.Now().Add(downloadURLTTL)}
-	c.dlMu.Unlock()
-	return url, nil
+	return v.(string), nil
 }
 
 // DropDownloadURL invalidates a cached download URL so the next request
@@ -443,7 +477,44 @@ func (c *Client) DownloadURL(ctx context.Context, f File) (string, error) {
 func (c *Client) DropDownloadURL(f File) {
 	c.dlMu.Lock()
 	delete(c.dlURLs, f.ID())
+	delete(c.dlFails, f.ID())
 	c.dlMu.Unlock()
+	fs.Debugf(nil, "baidunetdisk: dropped download URL for %q, next open re-signs", f.Path)
+}
+
+// NoteSpanTruncation records a span that ended short of its requested bytes.
+// Consecutive truncations on the same cached URL mean the signature is being
+// killed: at maxSpanTruncations the URL is dropped so the next open resolves
+// a fresh one. It reports whether the URL was dropped.
+func (c *Client) NoteSpanTruncation(f File) bool {
+	key := f.ID()
+	c.dlMu.Lock()
+	if c.dlFails == nil {
+		c.dlFails = map[string]int{}
+	}
+	c.dlFails[key]++
+	n := c.dlFails[key]
+	c.dlMu.Unlock()
+	if n >= maxSpanTruncations {
+		fs.Debugf(nil, "baidunetdisk: %d consecutive truncated spans for %q, dropping burned download URL", n, f.Path)
+		c.DropDownloadURL(f)
+		return true
+	}
+	fs.Debugf(nil, "baidunetdisk: truncated span for %q (%d/%d)", f.Path, n, maxSpanTruncations)
+	return false
+}
+
+// NoteSpanComplete records a fully delivered span, clearing any truncation
+// streak on its URL.
+func (c *Client) NoteSpanComplete(f File) {
+	key := f.ID()
+	c.dlMu.Lock()
+	n := c.dlFails[key]
+	delete(c.dlFails, key)
+	c.dlMu.Unlock()
+	if n > 0 {
+		fs.Debugf(nil, "baidunetdisk: full span for %q after %d truncations, streak cleared", f.Path, n)
+	}
 }
 
 // resolveDownloadURL resolves a fresh download URL following the configured
