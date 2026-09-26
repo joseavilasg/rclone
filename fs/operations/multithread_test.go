@@ -161,6 +161,56 @@ func TestMultithreadCopyChunkWriterAlreadyExistser(t *testing.T) {
 	assert.True(t, writer.closeCalled, "the chunk writer must be closed before the lookup")
 }
 
+// TestMultithreadCopyCountsDedupedFileAsPending pins that a file stays in the
+// progress total while its chunk writer resolves it. A dedupe pre-check can
+// spend minutes reading the source before deciding, and a transfer that is not
+// accounted yet belongs to no total, so the denominator would read as nothing
+// left to do while the copy was still running. Measured as a delta so the
+// assertion only depends on this test's own file.
+func TestMultithreadCopyCountsDedupedFileAsPending(t *testing.T) {
+	ctx := context.Background()
+	f, err := mockfs.NewFs(ctx, "potato", "", nil)
+	require.NoError(t, err)
+
+	// Hold inside OpenChunkWriter, as a pre-check hashing the source would.
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	var once sync.Once
+	f.Features().OpenChunkWriter = func(ctx context.Context, remote string, src fs.ObjectInfo, options ...fs.OpenOption) (fs.ChunkWriterInfo, fs.ChunkWriter, error) {
+		once.Do(func() { close(entered) })
+		<-release
+		return fs.ChunkWriterInfo{ChunkSize: int64(4 * fs.Mebi), Concurrency: 1}, &alreadyExistsWriter{}, nil
+	}
+
+	result := mockobject.New("file.bin").WithContent([]byte("already present"), mockobject.SeekModeNone)
+	f.(*mockfs.Fs).AddObject(result)
+
+	srcObj := mockobject.New("file.bin").WithContent([]byte(random.String(2*(1<<20))), mockobject.SeekModeNone)
+	srcFs, err := mockfs.NewFs(ctx, "sausage", "", nil)
+	require.NoError(t, err)
+	srcObj.SetFs(srcFs)
+
+	stats := accounting.GlobalStats()
+	baseline := stats.GetBytesWithPending()
+	tr := stats.NewTransfer(srcObj, nil)
+
+	done := make(chan error, 1)
+	go func() {
+		_, copyErr := multiThreadCopy(ctx, f, "file.bin", srcObj, 4, tr)
+		tr.Done(ctx, copyErr)
+		done <- copyErr
+	}()
+
+	<-entered
+	assert.Equal(t, srcObj.Size(), stats.GetBytesWithPending()-baseline,
+		"the file must stay in the progress total while the chunk writer resolves it")
+
+	close(release)
+	require.NoError(t, <-done)
+	assert.Equal(t, int64(0), stats.GetBytesWithPending()-baseline,
+		"the total must drop back once the file resolves without transferring")
+}
+
 // splitDstFs opts a mock destination into 50/50 split upload progress.
 type splitDstFs struct {
 	fs.Fs
