@@ -445,6 +445,13 @@ func multiThreadCopy(ctx context.Context, f fs.Fs, remote string, src fs.Object,
 		return nil, fmt.Errorf("multi-thread copy: can't copy zero sized file")
 	}
 
+	// Account the transfer before the chunk writer gets to look at the
+	// source. A writer may spend minutes on it (a dedupe pre-check hashes
+	// the file) before a single byte is counted, and until this account
+	// exists the file's size is in no total at all, so the progress
+	// denominator would drop to nothing while the copy was still running.
+	tr.Account(ctx, nil)
+
 	info, chunkWriter, err := openChunkWriter(ctx, remote, src, options...)
 	if err != nil {
 		return nil, fmt.Errorf("multi-thread copy: failed to open chunk writer: %w", err)
