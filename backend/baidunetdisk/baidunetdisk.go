@@ -617,9 +617,11 @@ func parseObjectRange(options []fs.OpenOption, size int64) (start, end int64, er
 }
 
 // openSpan serves one span as a ranged GET. A 4xx on the cached signature
-// means it went stale: it is dropped and resolved fresh once.
+// means it went stale: it is dropped and resolved fresh once. The body is
+// monitored so truncated spans count against the cached URL.
 func (o *Object) openSpan(ctx context.Context, start, end int64) (io.ReadCloser, error) {
 	for attempt := 0; ; attempt++ {
+		fs.Debugf(o.remote, "baidunetdisk: download attempt %d for range bytes=%d-%d", attempt+1, start, end)
 		signedURL, err := o.downloadURL(ctx)
 		if err != nil {
 			return nil, err
@@ -634,11 +636,59 @@ func (o *Object) openSpan(ctx context.Context, start, end int64) (io.ReadCloser,
 		}
 		if res.StatusCode >= 400 && res.StatusCode <= 499 && attempt == 0 {
 			_ = res.Body.Close()
+			fs.Debugf(o.remote, "baidunetdisk: status %d on cached signature, dropping and re-signing once", res.StatusCode)
 			o.fs.client.DropDownloadURL(o.info)
 			continue
 		}
-		return spanBody(o.remote, res, o.info.Size)
+		body, err := spanBody(o.remote, res, o.info.Size)
+		if err != nil {
+			return nil, err
+		}
+		return &monitoredBody{
+			body:   body,
+			client: o.fs.client,
+			file:   o.info,
+			remote: o.remote,
+			want:   end - start + 1,
+		}, nil
 	}
+}
+
+// monitoredBody watches a download span to the end: a body that dies short
+// of its requested bytes counts a truncation against the cached URL (three in
+// a row re-signs it), whether it ends in a clean EOF or a connection error,
+// while a full delivery clears the streak. An early close (aborted chunk)
+// stays neutral.
+type monitoredBody struct {
+	body   io.ReadCloser
+	client *api.Client
+	file   api.File
+	remote string
+	want   int64
+	got    int64
+	noted  bool
+}
+
+func (b *monitoredBody) Read(p []byte) (n int, err error) {
+	n, err = b.body.Read(p)
+	if n > 0 {
+		b.got += int64(n)
+	}
+	if err != nil && !b.noted {
+		b.noted = true
+		if b.want >= 0 && b.got < b.want {
+			b.client.NoteSpanTruncation(b.file)
+		} else {
+			b.client.NoteSpanComplete(b.file)
+		}
+	}
+	return n, err
+}
+
+// Close closes the underlying body without judging it: only spans read to
+// their end (or their truncation) report.
+func (b *monitoredBody) Close() error {
+	return b.body.Close()
 }
 
 // spanBody interprets a download response: a full reply means the server

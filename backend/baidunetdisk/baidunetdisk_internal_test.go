@@ -10,6 +10,7 @@ import (
 	"io"
 	"mime"
 	"mime/multipart"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -69,6 +70,16 @@ type testAPI struct {
 	sliceData    map[string][]byte
 	failUploadID string // uploadid whose slices answer "uploadid expired"
 	locateCalls  int
+	// Truncation script for /final: resolveCount numbers every crack dlink
+	// (?gen=N). Generations below badGens always die short of Content-Length
+	// (burned signatures); afterwards each GET consumes one truncateNext
+	// entry (a scripted transient). Both model the CDN killing connections.
+	resolveCount int
+	badGens      int
+	truncateNext []bool
+	// killNext scripts abrupt connection kills per /final GET: hijack the
+	// connection and close it mid-body so the client sees reset, not EOF.
+	killNext []bool
 }
 
 func (a *testAPI) recordCall(r *http.Request) {
@@ -108,8 +119,13 @@ func (a *testAPI) handler() http.Handler {
 			// official: dlink points at the redirect chase endpoint
 			io.WriteString(w, `{"errno":0,"list":[{"dlink":"`+host+`/dl?sign=abc"}]}`)
 		case r.URL.Path == "/api/filemetas":
-			// crack: direct dlink to the CDN
-			io.WriteString(w, `{"errno":0,"info":[{"dlink":"`+host+`/final"}]}`)
+			// crack: direct dlink to the CDN, numbered per resolution so
+			// tests can burn whole generations (?gen=N)
+			a.mu.Lock()
+			gen := a.resolveCount
+			a.resolveCount++
+			a.mu.Unlock()
+			io.WriteString(w, `{"errno":0,"info":[{"dlink":"`+host+`/final?gen=`+strconv.Itoa(gen)+`"}]}`)
 		case r.URL.Path == "/api/mediainfo":
 			// crack_video: payload wrapped in errno 31023
 			io.WriteString(w, `{"errno":31023,"info":[{"dlink":"`+host+`/final"}]}`)
@@ -329,10 +345,27 @@ func (a *testAPI) serveFilemanager(w http.ResponseWriter, r *http.Request) {
 }
 
 // serveFinal serves a.data honoring Range requests, matching the quark CDN
-// fake so rclone's multithread copy path is exercised faithfully.
+// fake so rclone's multithread copy path is exercised faithfully. Generations
+// below badGens and scripted truncateNext entries die short of the declared
+// Content-Length, which surfaces client-side as unexpected EOF.
 func (a *testAPI) serveFinal(w http.ResponseWriter, r *http.Request) {
 	a.mu.Lock()
 	a.ranges = append(a.ranges, r.Header.Get("Range"))
+	gen, _ := strconv.Atoi(r.URL.Query().Get("gen"))
+	truncate := false
+	kill := false
+	if gen < a.badGens {
+		truncate = true
+	} else {
+		if len(a.truncateNext) > 0 {
+			truncate = a.truncateNext[0]
+			a.truncateNext = a.truncateNext[1:]
+		}
+		if len(a.killNext) > 0 {
+			kill = a.killNext[0]
+			a.killNext = a.killNext[1:]
+		}
+	}
 	a.mu.Unlock()
 	var start, end int64
 	if _, err := fmt.Sscanf(strings.TrimPrefix(r.Header.Get("Range"), "bytes="), "%d-%d", &start, &end); err != nil || start < 0 {
@@ -342,10 +375,49 @@ func (a *testAPI) serveFinal(w http.ResponseWriter, r *http.Request) {
 	if end > int64(len(a.data)-1) {
 		end = int64(len(a.data) - 1)
 	}
+	if kill {
+		// Die mid-body with the connection: the client sees reset, never EOF.
+		hj, ok := w.(http.Hijacker)
+		if !ok {
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		conn, rw, err := hj.Hijack()
+		if err != nil {
+			return
+		}
+		fmt.Fprintf(rw, "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes %d-%d/%d\r\nContent-Length: %d\r\nConnection: close\r\n\r\n", start, end, len(a.data), end-start+1)
+		_, _ = rw.Write(a.data[start : start+(end-start+1)/2])
+		_ = rw.Flush()
+		// Abortive close: RST on the wire, never EOF.
+		if tcp, ok := conn.(*net.TCPConn); ok {
+			_ = tcp.SetLinger(0)
+		}
+		_ = conn.Close()
+		return
+	}
 	w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", start, end, len(a.data)))
 	w.Header().Set("Content-Length", strconv.FormatInt(end-start+1, 10))
 	w.WriteHeader(http.StatusPartialContent)
+	if truncate {
+		// declare the full span but deliver half: the client sees EOF early
+		half := (end - start + 1) / 2
+		_, _ = w.Write(a.data[start : start+half])
+		return
+	}
 	_, _ = w.Write(a.data[start : end+1])
+}
+
+func (a *testAPI) filemetasCalls() int {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	n := 0
+	for _, c := range a.calls {
+		if strings.Contains(c, "/api/filemetas") {
+			n++
+		}
+	}
+	return n
 }
 
 func (a *testAPI) allRanges() []string {
@@ -498,6 +570,109 @@ func TestDownloadURLReuse(t *testing.T) {
 	apiCalls := strings.Join(a.calls, " ")
 	assert.Equal(t, 1, strings.Count(apiCalls, "/api/filemetas"), "one resolved URL must serve every ranged GET")
 	assert.Equal(t, []string{"bytes=0-2", "bytes=3-5"}, a.allRanges())
+}
+
+// readSpanWithRetries mimics the core ReOpen loop: open the whole span,
+// read it to the end, and retry the open on a short body (clean EOF or a
+// killed connection alike).
+func readSpanWithRetries(t *testing.T, o *Object, size int64) []byte {
+	t.Helper()
+	ctx := context.Background()
+	for attempt := 0; attempt < 5; attempt++ {
+		rc, err := o.Open(ctx, &fs.RangeOption{Start: 0, End: size - 1})
+		require.NoError(t, err)
+		got, err := io.ReadAll(rc)
+		_ = rc.Close()
+		if err == nil {
+			return got
+		}
+		t.Logf("attempt %d short: %v", attempt+1, err)
+	}
+	t.Fatal("span never completed within 5 opens")
+	return nil
+}
+
+// TestDownloadResignAfterTruncations pins the burned-URL recovery: three
+// consecutive truncated spans drop the cached signature and the next open
+// re-signs a fresh generation that delivers.
+func TestDownloadResignAfterTruncations(t *testing.T) {
+	data := []byte("resign-download-bytes-0123456789")
+	a, f, _ := newTestAPI(t, data, "crack")
+	a.badGens = 1 // generation 0 always dies short; generation 1+ serves full
+
+	o, err := f.NewObject(context.Background(), "file.bin")
+	require.NoError(t, err)
+
+	assert.Equal(t, data, readSpanWithRetries(t, o.(*Object), int64(len(data))))
+	assert.Equal(t, 2, a.filemetasCalls(), "three truncations on gen0 must resign once")
+}
+
+// TestDownloadNoResignBelowThreshold pins that transient truncations do not
+// re-sign: two short bodies on a healthy URL keep using it.
+func TestDownloadNoResignBelowThreshold(t *testing.T) {
+	data := []byte("transient-truncation-bytes-0123456789")
+	a, f, _ := newTestAPI(t, data, "crack")
+	a.truncateNext = []bool{true, true}
+
+	o, err := f.NewObject(context.Background(), "file.bin")
+	require.NoError(t, err)
+
+	assert.Equal(t, data, readSpanWithRetries(t, o.(*Object), int64(len(data))))
+	assert.Equal(t, 1, a.filemetasCalls(), "two truncations must not resign")
+}
+
+// TestDownloadTruncationStreakResets pins the streak reset: a full span
+// between truncations clears the counter, so 2+1+2 never reaches three in
+// a row and never re-signs.
+func TestDownloadTruncationStreakResets(t *testing.T) {
+	data := []byte("streak-reset-bytes-0123456789")
+	a, f, _ := newTestAPI(t, data, "crack")
+	a.truncateNext = []bool{true, true, false, true, true, false}
+
+	o, err := f.NewObject(context.Background(), "file.bin")
+	require.NoError(t, err)
+
+	assert.Equal(t, data, readSpanWithRetries(t, o.(*Object), int64(len(data))))
+	assert.Equal(t, 1, a.filemetasCalls(), "a reset streak must not resign")
+}
+
+// TestDownloadResignAfterResets pins that connection kills count like clean
+// truncations: three RSTs in a row drop the cached URL and the next open
+// re-signs a generation that delivers.
+func TestDownloadResignAfterResets(t *testing.T) {
+	data := []byte("resign-after-reset-bytes-0123456789")
+	a, f, _ := newTestAPI(t, data, "crack")
+	a.killNext = []bool{true, true, true}
+
+	o, err := f.NewObject(context.Background(), "file.bin")
+	require.NoError(t, err)
+
+	assert.Equal(t, data, readSpanWithRetries(t, o.(*Object), int64(len(data))))
+	assert.Equal(t, 2, a.filemetasCalls(), "three kills in a row must resign once")
+}
+
+// TestDownloadURLSingleflight pins that concurrent resolutions for one file
+// collapse into a single signature: N chunk starts share one filemetas call.
+func TestDownloadURLSingleflight(t *testing.T) {
+	a, _, client := newTestAPI(t, []byte("0123456789"), "crack")
+
+	const callers = 8
+	var wg sync.WaitGroup
+	urls := make([]string, callers)
+	errs := make([]error, callers)
+	for i := 0; i < callers; i++ {
+		wg.Add(1)
+		go func(idx int) {
+			defer wg.Done()
+			urls[idx], errs[idx] = client.DownloadURL(context.Background(), api.File{FsId: 11, Path: "/file.bin"})
+		}(i)
+	}
+	wg.Wait()
+	for i := 0; i < callers; i++ {
+		require.NoError(t, errs[i])
+		assert.Equal(t, urls[0], urls[i], "every concurrent caller must share one signature")
+	}
+	assert.Equal(t, 1, a.filemetasCalls(), "concurrent resolutions must collapse into one flight")
 }
 
 // TestTokenRefreshPins the refresh dance: an errno 111 API answer triggers an

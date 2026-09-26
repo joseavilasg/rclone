@@ -89,7 +89,9 @@ Files are read as a series of ranged requests over one resolved download
 URL per file, which the backend re-signs only when it expires. The API and
 metadata traffic use the default HTTP client, while the download requests
 run on a dedicated client stamped with the user agent each download API
-expects.
+expects. A span that dies short of its requested bytes counts against the
+cached URL: three truncations in a row drop it as burned and the next open
+re-signs a fresh one, so retries stop replaying a killed signature.
 
 ## Uploads
 
