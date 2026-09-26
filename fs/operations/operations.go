@@ -1419,6 +1419,7 @@ func rcatSrc(ctx context.Context, fdst fs.Fs, dstFileName string, in io.ReadClos
 
 	ci := fs.GetConfig(ctx)
 	tr := accounting.Stats(ctx).NewTransferRemoteSize(dstFileName, -1, nil, fdst)
+	ctx = tr.EnableSplitUpload(ctx, fdst)
 	defer func() {
 		tr.Done(ctx, err)
 	}()
@@ -1864,6 +1865,7 @@ func RcatSize(ctx context.Context, fdst fs.Fs, dstFileName string, in io.ReadClo
 		var err error
 		// Size known use Put
 		tr := accounting.Stats(ctx).NewTransferRemoteSize(dstFileName, size, nil, fdst)
+		ctx = tr.EnableSplitUpload(ctx, fdst)
 		defer func() {
 			tr.Done(ctx, err)
 		}()
@@ -1991,6 +1993,7 @@ func CopyURLMulti(ctx context.Context, fdst fs.Fs, dstFileName string, srcObj fs
 
 	if needsCopy {
 		tr := accounting.Stats(ctx).NewTransferRemoteSize(dstFileName, srcObj.Size(), nil, fdst)
+		ctx = tr.EnableSplitUpload(ctx, fdst)
 		defer func() {
 			tr.Done(ctx, err)
 		}()

@@ -19,6 +19,7 @@ import (
 	"github.com/rclone/rclone/backend/baidunetdisk/api"
 	"github.com/rclone/rclone/backend/local"
 	"github.com/rclone/rclone/fs"
+	"github.com/rclone/rclone/fs/accounting"
 	fshash "github.com/rclone/rclone/fs/hash"
 	"golang.org/x/sync/errgroup"
 )
@@ -461,6 +462,9 @@ func (j *uploadJob) uploadPass(ctx context.Context, pre *api.PrecreateResp, uplo
 				func() (io.Reader, error) { return open(offset, sz) }); err != nil {
 				return err
 			}
+			// Second half of the split progress bar: the core counted the
+			// source reads, the backend reports the destination uploads.
+			accounting.AddUploadProgress(gCtx, sz)
 			markMu.Lock()
 			pre.BlockList[i] = -1
 			markMu.Unlock()

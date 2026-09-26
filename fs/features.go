@@ -779,6 +779,20 @@ type ChunkWriterAlreadyExistser interface {
 	AlreadyExists() bool
 }
 
+// UploadProgressSplitter is an optional interface for Fs.
+//
+// A backend whose upload cannot stream (e.g. it must hash the whole content
+// before the server accepts the first byte) implements it to split one
+// transfer's progress 50/50: source reads fill the first half, destination
+// upload bytes reported with accounting.AddUploadProgress fill the second.
+// Without it a transfer counts source reads only and sits at 100% while the
+// real upload still runs.
+type UploadProgressSplitter interface {
+	// SplitUploadProgress reports whether this Fs splits transfer progress
+	// between source reads and reported destination upload bytes.
+	SplitUploadProgress() bool
+}
+
 // UserInfoer is an optional interface for Fs
 type UserInfoer interface {
 	// UserInfo returns info about the connected user
