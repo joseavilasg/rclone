@@ -1333,6 +1333,70 @@ func (o *Object) hashStale() (bool, error) {
 	return !o.modTime.Equal(oldtime) || oldsize != o.size, nil
 }
 
+// hashProgressStep is how many percent of the file separate two hash progress
+// lines. Stepping by a percentage rather than by a time interval keeps the
+// number of lines per file fixed however fast or slow the disk turns out to be.
+const hashProgressStep = 10
+
+// hashProgressReader reports how far a whole-file hash has got. streamHashes
+// opens the file itself instead of reading through the transfer's reader, so
+// the reads carry no accounting.Account: --stats and -P sit at zero for the
+// whole hash and these lines are the only sign it is moving. Nothing is
+// uploaded by this reader, so a file that later dedupes still reports a full
+// 100% read against 0 B transferred.
+type hashProgressReader struct {
+	r     io.ReadCloser
+	o     *Object
+	step  int64 // bytes between two reports
+	next  int64 // byte offset of the next report
+	total int64
+	read  int64
+	index int  // which multiple of hashProgressStep the next report is
+	done  bool // the closing 100% report has been written
+}
+
+// wrapHashProgress returns in wrapped so a whole-file hash reports its
+// progress. Small files, whose hash takes no time worth reporting, and objects
+// of unknown size are returned untouched.
+func (o *Object) wrapHashProgress(in io.ReadCloser) io.ReadCloser {
+	if o.size <= 0 {
+		return in
+	}
+	step := o.size / (100 / hashProgressStep)
+	if step <= 0 {
+		return in
+	}
+	return &hashProgressReader{
+		r:     in,
+		o:     o,
+		step:  step,
+		next:  step,
+		total: o.size,
+		index: 1,
+	}
+}
+
+func (p *hashProgressReader) Read(b []byte) (int, error) {
+	n, err := p.r.Read(b)
+	p.read += int64(n)
+	// Label from the milestone index, not from the byte offset: step is
+	// total/100*step truncated down, so deriving the percentage from the
+	// bytes would report 9% where the milestone is the 10% one. The index is
+	// capped below 100 so the closing report is the only 100% line.
+	for p.read >= p.next && p.next < p.total && p.index*hashProgressStep < 100 {
+		fs.Infof(p.o, "local: hashing %d%% (%d/%d bytes)", p.index*hashProgressStep, p.next, p.total)
+		p.index++
+		p.next += p.step
+	}
+	if err == io.EOF && p.read >= p.total && !p.done {
+		p.done = true
+		fs.Infof(p.o, "local: hashing 100%% (%d/%d bytes)", p.read, p.total)
+	}
+	return n, err
+}
+
+func (p *hashProgressReader) Close() error { return p.r.Close() }
+
 // streamHashes reads the object once and returns every hash in set, caching
 // the results so a later Hash call for any of those types needs no read.
 func (o *Object) streamHashes(ctx context.Context, set hash.Set) (map[hash.Type]string, error) {
@@ -1354,7 +1418,7 @@ func (o *Object) streamHashes(ctx context.Context, set hash.Set) (map[hash.Type]
 	if o.fs.opt.NoCheckUpdated {
 		in = readers.NewLimitedReadCloser(in, o.size)
 	}
-	hashes, err := hash.StreamTypes(readers.NewContextReader(ctx, in), set)
+	hashes, err := hash.StreamTypes(readers.NewContextReader(ctx, o.wrapHashProgress(in)), set)
 	closeErr := in.Close()
 	if err != nil {
 		return nil, fmt.Errorf("hash: failed to read: %w", err)
