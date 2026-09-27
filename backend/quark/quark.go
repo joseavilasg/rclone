@@ -393,6 +393,14 @@ func (f *Fs) Mkdir(ctx context.Context, dir string) error {
 		}
 		fid, err := f.client.MakeDir(ctx, part, parentID)
 		if err != nil {
+			if api.IsDirExists(err) {
+				// Another transfer created it first. Resolve it and keep
+				// walking the chain, so the levels below are created too.
+				if _, err := f.resolvePath(ctx, next); err == nil {
+					cur = next
+					continue
+				}
+			}
 			return fmt.Errorf("quark: mkdir %q: %w", next, err)
 		}
 		f.mu.Lock()
@@ -446,19 +454,38 @@ func (f *Fs) Move(ctx context.Context, src fs.Object, remote string) (fs.Object,
 	srcDir, srcLeaf := splitRemote(o.remote)
 	dstDir, dstLeaf := splitRemote(remote)
 	leaf := f.opt.Enc.FromStandardName(dstLeaf)
-	if srcDir != dstDir || srcLeaf != dstLeaf {
+	if o.fs == f && srcDir == dstDir {
+		// Both paths are relative to this root, so they can be compared as
+		// strings and only a rename is left to do.
 		if srcLeaf != dstLeaf {
 			if err := f.client.Rename(ctx, o.info.Fid, leaf); err != nil {
 				return nil, fmt.Errorf("quark: rename %q: %w", src, err)
 			}
 		}
-		if srcDir != dstDir {
-			dstDirID, err := f.resolveDir(ctx, dstDir)
-			if err != nil {
-				return nil, err
-			}
+	} else {
+		// The two paths are relative to their own roots, so the same string
+		// can mean a different folder on each side and comparing them would
+		// read a cross-root move as "the file is already there": no API call
+		// and a success reported for a transfer that never happened. Resolve
+		// each side in its own Fs and compare the folder ids instead, which
+		// is what /file/move takes: a fid names a folder anywhere in the
+		// account.
+		dstDirID, err := f.resolveDir(ctx, dstDir)
+		if err != nil {
+			return nil, err
+		}
+		srcDirID, err := o.fs.resolveDir(ctx, srcDir)
+		if err != nil {
+			return nil, err
+		}
+		if srcDirID != dstDirID {
 			if err := f.client.Move(ctx, o.info.Fid, dstDirID); err != nil {
 				return nil, fmt.Errorf("quark: move %q: %w", src, err)
+			}
+		}
+		if srcLeaf != dstLeaf {
+			if err := f.client.Rename(ctx, o.info.Fid, leaf); err != nil {
+				return nil, fmt.Errorf("quark: rename %q: %w", src, err)
 			}
 		}
 	}

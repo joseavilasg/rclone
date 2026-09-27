@@ -6,11 +6,13 @@ import (
 	"crypto/md5"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"html"
 	"io"
 	"net/http"
 	"net/url"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -163,6 +165,31 @@ func (c *Client) rotateCookie(res *http.Response) {
 	}
 }
 
+// codeNameConflict is the envelope code quark returns when it refuses a create
+// because the name collides with an entry that already exists (同名冲突).
+const codeNameConflict = 23008
+
+// APIError is a response whose envelope reports a failure. The code is kept
+// because some codes only mean that someone else got there first, which the
+// caller has to tell apart from a real failure.
+type APIError struct {
+	Message string
+	Status  int
+	Code    int
+}
+
+func (e *APIError) Error() string {
+	return fmt.Sprintf("quark: %s (status %d, code %d)", e.Message, e.Status, e.Code)
+}
+
+// IsDirExists reports whether err is quark refusing a create because a
+// directory of that name is already there. It is not a failure: it is the
+// expected answer when parallel transfers race to create the same folder.
+func IsDirExists(err error) bool {
+	var e *APIError
+	return errors.As(err, &e) && e.Code == codeNameConflict
+}
+
 // Do makes a request to the API, decodes the JSON envelope and returns the
 // body bytes. out may be nil. A non-zero envelope code is returned as an error.
 func (c *Client) Do(ctx context.Context, method, pathname string, params url.Values, body interface{}, out interface{}) (err error) {
@@ -227,10 +254,13 @@ func (c *Client) Do(ctx context.Context, method, pathname string, params url.Val
 	// resp is the generic envelope: error if the code is non-zero
 	var resp Resp
 	if err := json.Unmarshal(resBytes, &resp); err != nil {
+		if ct := res.Header.Get("Content-Type"); ct != "" && !strings.Contains(ct, "json") {
+			return fmt.Errorf("quark: %s: %w", notAnEnvelope(res, resBytes), err)
+		}
 		return fmt.Errorf("quark: decode response: %w", err)
 	}
 	if resp.Status >= 400 || resp.Code != 0 {
-		return fmt.Errorf("quark: %s (status %d, code %d)", resp.Message, resp.Status, resp.Code)
+		return &APIError{Message: resp.Message, Status: resp.Status, Code: resp.Code}
 	}
 	if out != nil {
 		if err := json.Unmarshal(resBytes, out); err != nil {
@@ -238,6 +268,47 @@ func (c *Client) Do(ctx context.Context, method, pathname string, params url.Val
 		}
 	}
 	return nil
+}
+
+// urlInBody matches an absolute URL inside a body that is not the JSON
+// envelope. It is deliberately not an HTML parse: those pages arrive chunked
+// and mangled, but a URL is delimited, so it is the part that survives intact
+// and the part that identifies the page.
+var urlInBody = regexp.MustCompile(`https?://[^\s"'<>]{4,220}`)
+
+// notAnEnvelope describes a response that is not quark's JSON envelope, so
+// something other than the API answered. The cause is not guessed, because a
+// block page, a captcha, a login redirect and a maintenance notice all look
+// the same from here. What gets reported is only what the server said: the
+// status and content type, the trace id and the edge's block flag from the
+// headers, and the URLs the body points at, which is where the offending page
+// and its own per-request id live.
+func notAnEnvelope(res *http.Response, body []byte) string {
+	parts := []string{fmt.Sprintf("HTTP %d with Content-Type %q, not the JSON envelope",
+		res.StatusCode, res.Header.Get("Content-Type"))}
+	if v := res.Header.Get("EagleEye-TraceId"); v != "" {
+		parts = append(parts, "trace="+v)
+	}
+	if v := res.Header.Get("bxpunish"); v != "" {
+		parts = append(parts, "bxpunish="+v)
+	}
+	if urls := urlInBody.FindAll(body, 2); len(urls) > 0 {
+		quoted := make([]string, 0, len(urls))
+		for _, u := range urls {
+			// The query is dropped: it is either constant (wh_ttid=pc), a copy
+			// of the endpoint already named by the caller, or an id long enough
+			// that truncating it leaves something that looks usable and is not.
+			// The trace id above is the value worth quoting to support.
+			if i := bytes.IndexByte(u, '?'); i >= 0 {
+				u = u[:i]
+			}
+			quoted = append(quoted, string(u))
+		}
+		parts = append(parts, "the body pointed at "+strings.Join(quoted, " and "))
+	} else {
+		parts = append(parts, "the body pointed at no URL")
+	}
+	return strings.Join(parts, ", ")
 }
 
 // pdsHostSuffix is the quark object-storage transfer subnet (upload ul-* and
