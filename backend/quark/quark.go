@@ -324,8 +324,15 @@ func (f *Fs) List(ctx context.Context, dir string) (entries fs.DirEntries, err e
 	return entries, nil
 }
 
-// newObject returns an Object for remote or fs.ErrorObjectNotFound
-func (f *Fs) newObject(ctx context.Context, remote string) (*Object, error) {
+// newObject returns an Object for remote or fs.ErrorObjectNotFound.
+//
+// The error return is fs.Object, not *Object, deliberately. A nil *Object
+// boxed into the interface is not == nil, so a caller that nil-checks the
+// object instead of the error -- union's upstream.WrapObject does exactly
+// that -- wraps a nil and only panics much later inside Size(). Returning
+// the interface keeps "not found" a true nil. Every upstream rclone backend
+// (azureblob, b2, s3, drive, local, mega) uses this shape.
+func (f *Fs) newObject(ctx context.Context, remote string) (fs.Object, error) {
 	dir, leaf := splitRemote(remote)
 	if leaf == "" {
 		return nil, fs.ErrorObjectNotFound
@@ -593,7 +600,11 @@ func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, op
 	o.fs.purgeDirs()
 	no, err := o.fs.newObject(ctx, o.remote)
 	if err == nil {
-		*o = *no
+		// newObject hands back the interface, so assert back to the concrete
+		// type to refresh the receiver's info in place.
+		if n, ok := no.(*Object); ok {
+			*o = *n
+		}
 	}
 	return err
 }
