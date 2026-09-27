@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/tls"
+	"fmt"
 	"io"
 	"log/slog"
 	"net"
@@ -19,6 +20,44 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
+
+func TestIsDirExists(t *testing.T) {
+	for _, test := range []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{
+			name: "name conflict is an existing directory",
+			err:  &APIError{Message: "file is downloading[同名冲突]", Status: 400, Code: 23008},
+			want: true,
+		},
+		{
+			name: "another code is a real failure",
+			err:  &APIError{Message: "no permission", Status: 403, Code: 23000},
+			want: false,
+		},
+		{
+			name: "a success code is not a conflict",
+			err:  &APIError{Message: "ok", Status: 200, Code: 0},
+			want: false,
+		},
+		{
+			name: "an untyped error is not a conflict",
+			err:  fmt.Errorf("quark: do request: %w", fs.ErrorPermissionDenied),
+			want: false,
+		},
+		{
+			name: "a wrapped API error is still recognised",
+			err:  fmt.Errorf("quark: mkdir %q: %w", "Chinese Dramas", &APIError{Status: 400, Code: 23008}),
+			want: true,
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			assert.Equal(t, test.want, IsDirExists(test.err))
+		})
+	}
+}
 
 // plainHTTPResponder accepts every dial and answers a plain HTTP 200, forcing
 // the TLS->plain-HTTP sentinel on any https request (a TLS dial to it sees an
@@ -371,4 +410,104 @@ func TestFshttpTransportFilterOverridesForcedUA(t *testing.T) {
 	mu.Lock()
 	defer mu.Unlock()
 	assert.Equal(t, UserAgent, gotUA, "the transport filter must override the forced rclone/ UA")
+}
+
+// TestDoReportsNonJSONResponse pins what an operator sees when the answer is a
+// web page instead of the envelope. Everything reported is something the server
+// said and nothing concludes what the page was: the trace id is what quark's
+// support asks for, and the URLs are where the page and its own per-request id
+// live.
+func TestDoReportsNonJSONResponse(t *testing.T) {
+	const page = `<a id="a-link" href="https://dev.g.alicdn.com/sd/punish/` +
+		`waf_block_deny.html?wh_ttid=pc&qrcode=OWVePXpUcrEE3vpdUfsz_A">`
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/html;charset=UTF-8")
+		w.Header().Set("EagleEye-TraceId", "2150426217905384951048247e335c")
+		w.Header().Set("bxpunish", "1")
+		io.WriteString(w, page)
+	}))
+	defer srv.Close()
+
+	c := NewClient(context.Background(), srv.Client(), srv.Client(), srv.URL+"/1/clouddrive", "https://pan.quark.cn", "ucpro", "k1=v1")
+	var resp DownResp
+	err := c.Do(context.Background(), http.MethodPost, "/file/upload/pre", nil, map[string]interface{}{"file_name": "x"}, &resp)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), `HTTP 200 with Content-Type "text/html;charset=UTF-8"`)
+	assert.Contains(t, err.Error(), "trace=2150426217905384951048247e335c")
+	assert.Contains(t, err.Error(), "bxpunish=1")
+	assert.Contains(t, err.Error(), "https://dev.g.alicdn.com/sd/punish/waf_block_deny.html")
+	assert.NotContains(t, err.Error(), "qrcode=", "the query is dropped: it only bloats the log")
+	assert.NotContains(t, err.Error(), "decode response")
+}
+
+// TestDoKeepsPlainDecodeErrorWhenContentTypeIsJSON guards the new branch from
+// swallowing the ordinary case: a JSON response with a broken body is a decode
+// problem, not something other than quark answering.
+func TestDoKeepsPlainDecodeErrorWhenContentTypeIsJSON(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json;charset=UTF-8")
+		io.WriteString(w, `{"status":200,"code":0,`)
+	}))
+	defer srv.Close()
+
+	c := NewClient(context.Background(), srv.Client(), srv.Client(), srv.URL+"/1/clouddrive", "https://pan.quark.cn", "ucpro", "k1=v1")
+	var resp DownResp
+	err := c.Do(context.Background(), http.MethodPost, "/file/upload/pre", nil, map[string]interface{}{"file_name": "x"}, &resp)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "decode response")
+	assert.NotContains(t, err.Error(), "not the JSON envelope")
+}
+
+func TestNotAnEnvelope(t *testing.T) {
+	for _, test := range []struct {
+		name    string
+		headers map[string]string
+		body    string
+		want    []string
+		notWant string
+	}{
+		{
+			name:    "block page reports status, type, trace, flag and url",
+			headers: map[string]string{"EagleEye-TraceId": "abc123", "bxpunish": "1"},
+			body:    `<a href="https://example.invalid/punish.html?q=1">`,
+			want:    []string{`Content-Type "text/html"`, "abc123", "bxpunish=1", "https://example.invalid/punish.html"},
+			notWant: "q=1",
+		},
+		{
+			name:    "trace only, and the missing flag is not invented",
+			headers: map[string]string{"EagleEye-TraceId": "abc123"},
+			body:    "no url here",
+			want:    []string{"abc123", "the body pointed at no URL"},
+			notWant: "bxpunish",
+		},
+		{
+			name:    "no diagnostics at all still says so",
+			headers: map[string]string{},
+			body:    "still no url",
+			want:    []string{"the body pointed at no URL"},
+			notWant: "trace=",
+		},
+		{
+			name:    "at most two urls are quoted",
+			headers: map[string]string{},
+			body:    `<a href="https://a.invalid/1"><a href="https://b.invalid/2"><a href="https://c.invalid/3">`,
+			want:    []string{"https://a.invalid/1", "https://b.invalid/2"},
+			notWant: "c.invalid",
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			h := http.Header{}
+			for k, v := range test.headers {
+				h.Set(k, v)
+			}
+			h.Set("Content-Type", "text/html")
+			got := notAnEnvelope(&http.Response{StatusCode: 200, Header: h}, []byte(test.body))
+			for _, w := range test.want {
+				assert.Contains(t, got, w)
+			}
+			if test.notWant != "" {
+				assert.NotContains(t, got, test.notWant)
+			}
+		})
+	}
 }
